@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: my-fastapi-app
+    env: python
+    plan: starter # 'free' is an option, but 'starter' has more resources
+    
+    # Set a specific, stable Python version to avoid build errors
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8 # Or a different stable version like 3.10.13
+    
+    # Use a multi-step build command to ensure build tools are up-to-date
+    # and to specify a pre-built wheel for `torch`
+    buildCommand: |
+      # Upgrade pip, setuptools, and wheel to prevent build errors
+      pip install --upgrade pip setuptools wheel
+      # Install a pre-built wheel for torch (Render has CUDA support)
+      # This can significantly speed up the build and prevent failures
+      # Note: Adjust the URL based on the Python version and PyTorch version
+      # For Python 3.11, CUDA 11.8:
+      pip install torch==2.7.1+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+      # Install the rest of the dependencies from requirements.txt
+      pip install -r requirements.txt
+      # Also, if needed, you may need to manually install torch-related packages
+      pip install torchvision==0.22.1 --extra-index-url https://download.pytorch.org/whl/cu118
+      pip install sentence-transformers==5.0.0
+      # You may need to add other missing packages here
+    
+    # The command to start the application
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    
+    # A health check path to monitor the service
+    healthCheckPath: /health # Make sure you have this endpoint in your app
+    
+    # A list of environment variables for your application
+  
