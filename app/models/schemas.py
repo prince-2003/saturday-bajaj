@@ -100,30 +100,30 @@ class QueryResponse(BaseModelConfig):
         ..., 
         description="List of answers corresponding to the input questions"
     )
-    metadata: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Additional metadata about the processing"
-    )
-    answer_metadata: Optional[List[AnswerMetadata]] = Field(
-        default=None,
-        description="Detailed metadata for each answer"
-    )
-    document_metadata: Optional[List[DocumentMetadata]] = Field(
-        default=None,
-        description="Metadata about processed documents"
-    )
-    performance_metrics: Optional[PerformanceMetrics] = Field(
-        default=None,
-        description="Performance metrics for the query"
-    )
-    model_usage: Optional[ModelUsage] = Field(
-        default=None,
-        description="Model usage statistics"
-    )
-    processing_id: Optional[str] = Field(
-        default=None,
-        description="Unique identifier for this processing request"
-    )
+    # metadata: Dict[str, Any] = Field(
+    #     default_factory=dict,
+    #     description="Additional metadata about the processing"
+    # )
+    # answer_metadata: Optional[List[AnswerMetadata]] = Field(
+    #     default=None,
+    #     description="Detailed metadata for each answer"
+    # )
+    # document_metadata: Optional[List[DocumentMetadata]] = Field(
+    #     default=None,
+    #     description="Metadata about processed documents"
+    # )
+    # performance_metrics: Optional[PerformanceMetrics] = Field(
+    #     default=None,
+    #     description="Performance metrics for the query"
+    # )
+    # model_usage: Optional[ModelUsage] = Field(
+    #     default=None,
+    #     description="Model usage statistics"
+    # )
+    # processing_id: Optional[str] = Field(
+    #     default=None,
+    #     description="Unique identifier for this processing request"
+    # )
 
 
 class ErrorResponse(BaseModelConfig):

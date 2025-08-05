@@ -82,8 +82,8 @@ class RetrievalService:
                        avg_confidence=response_metadata["avg_confidence"])
             
             return QueryResponse(
-                answers=all_answers,
-                metadata=response_metadata
+                answers=all_answers
+                # metadata=response_metadata  # Commented out to remove from API response
             )
             
         except Exception as e:
