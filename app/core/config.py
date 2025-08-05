@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     api_title: str = "LLM-Powered Intelligent Query-Retrieval System"
     api_version: str = "2.0.0"
     debug: bool = False
+    port: int = int(os.getenv("PORT", 8000))  # Port detection from environment
     
     # Authentication
     api_key: str = "f187d1bc4df8a6a7e6cba86fc31bdedfcce699eac885b85570bb61c6d6e8c7f2"

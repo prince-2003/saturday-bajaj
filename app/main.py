@@ -2,19 +2,46 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import structlog
+import uvicorn
 
-from app.core.config import settings
+# Set up logging early
 from app.core.logging import setup_logging
-from app.api.endpoints import hackrx, health
-
 setup_logging()
 logger = structlog.get_logger()
 
+# --- Everything above this line runs immediately ---
+
+try:
+    logger.info("Loading application settings...")
+    from app.core.config import settings
+    logger.info("Settings loaded successfully.")
+    
+    logger.info("Setting up API routers...")
+    from app.api.endpoints import hackrx, health
+    logger.info("Routers imported successfully.")
+
+except Exception as e:
+    logger.error("Failed to import modules or load settings", error=str(e), traceback=True)
+    # Re-raise the exception to crash the application,
+    # making the error visible in the logs
+    raise e
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting up Intelligent Query-Retrieval System")
-    yield
-    logger.info("Shutting down")
+    try:
+        logger.info("Starting up Intelligent Query-Retrieval System lifespan context...")
+        # Add any startup code here that might fail
+        # For example, connecting to databases
+        
+        # This is where your code should be.
+        # Everything after this runs on shutdown.
+        yield
+        
+        logger.info("Shutting down")
+    except Exception as e:
+        logger.error("Lifespan startup failed", error=str(e), traceback=True)
+        # Re-raise to ensure the app fails to start
+        raise e
 
 app = FastAPI(
     title="LLM-Powered Intelligent Query-Retrieval System",
@@ -31,7 +58,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include API routers
 app.include_router(hackrx.router, prefix="/api/v1")
 app.include_router(health.router, prefix="/api/v1")
 
@@ -43,11 +69,3 @@ async def root():
         "status": "operational"
     }
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
