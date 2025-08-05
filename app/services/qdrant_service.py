@@ -141,7 +141,6 @@ class QdrantService:
             search_results = self.client.search(
                 collection_name=collection_name,
                 query_vector=query_embedding,
-                query_filter=search_filter,
                 limit=top_k,
                 with_payload=True
             )
@@ -207,3 +206,23 @@ class QdrantService:
         except Exception as e:
             logger.error("Qdrant health check failed", error=str(e))
             return "unhealthy"
+        
+    async def create_payload_index_if_missing(self, collection_name: str, field_name: str, field_schema: str = "keyword"):
+        """Ensure an index exists for the given payload field."""
+        try:
+            collection_info = await self.client.get_collection(collection_name)
+            existing_indexes = collection_info.payload_schema or {}
+
+            if field_name not in existing_indexes:
+                await self.client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_name,
+                    field_schema=field_schema
+                )
+        except Exception as e:
+            logger.warning(f"Could not ensure index for {field_name}: {str(e)}")
+
+    def reset_qdrant(self):
+        
+        self.client.delete_collection(collection_name="documents")
+        print("Collection deleted.")

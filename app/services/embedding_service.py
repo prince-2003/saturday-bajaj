@@ -81,6 +81,7 @@ class EmbeddingService:
         except Exception as e:
             logger.error("Failed to process embeddings", error=str(e))
             return False
+
     
     async def search_similar(self, query: str, top_k: int = 10, 
                            document_id: Optional[str] = None) -> List[Dict[str, Any]]:

@@ -8,6 +8,7 @@ from app.services.embedding_service import EmbeddingService
 from app.services.optimized_llm_service import OptimizedLLMService
 from app.services.cache_service import IntelligentCacheService
 from app.services.database_service import DatabaseService
+from app.services.qdrant_service import QdrantService
 from app.models.schemas import QueryRequest, QueryResponse, DocumentMetadata
 
 logger = structlog.get_logger(__name__)
@@ -33,8 +34,8 @@ class RetrievalService:
                        question_count=len(request.questions))
             
             # Step 1: Process document
+            QdrantService().reset_qdrant()
             metadata, chunks = await self.document_processor.process_document(str(request.documents))
-            
             # Step 2: Store chunks in cache for retrieval
             self.document_chunks_cache[metadata.document_id] = chunks
             logger.info("Document chunks cached", document_id=metadata.document_id, chunk_count=len(chunks))
@@ -50,7 +51,8 @@ class RetrievalService:
                 logger.info("Processing question", index=i+1, question=question[:100])
                 
                 # Retrieve relevant context (currently returns empty)
-                context_chunks = await self._retrieve_context(question, metadata.document_id)
+                #context_chunks = await self._retrieve_context(question, metadata.document_id)
+                context_chunks = await self.embedding_service.search_similar(query=question,top_k=3,document_id=metadata.document_id)
                 
                 # Answer question
                 answer_result = await self.llm_service.answer_question_fast(question, context_chunks, metadata.document_id)
