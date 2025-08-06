@@ -79,6 +79,14 @@ class Settings(BaseSettings):
     target_response_time: int = 15  # seconds
     cache_hit_rate_target: float = 0.7
     
+    # Advanced Optimizations
+    enable_compression: bool = True
+    batch_size: int = 32
+    prefetch_embeddings: bool = True
+    lazy_load_models: bool = True
+    enable_query_optimization: bool = True
+    parallel_chunk_processing: bool = True
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

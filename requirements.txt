@@ -25,8 +25,8 @@ redis==5.0.1
 cachetools==5.3.2
 
 # Database
-SQLAlchemy==2.0.23
-psycopg2-binary==2.9.9
+SQLAlchemy>=2.0.25
+psycopg2-binary==2.9.10
 
 # Document processing
 PyPDF2==3.0.1
