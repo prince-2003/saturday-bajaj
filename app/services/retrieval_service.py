@@ -34,7 +34,7 @@ class RetrievalService:
                        question_count=len(request.questions))
             
             # Step 1: Process document
-            QdrantService().reset_qdrant()
+            self.embedding_service.qdrant_service.reset_qdrant()
             metadata, chunks = await self.document_processor.process_document(str(request.documents))
             # Step 2: Store chunks in cache for retrieval
             self.document_chunks_cache[metadata.document_id] = chunks
@@ -43,29 +43,27 @@ class RetrievalService:
             # Step 3: Store embeddings (for future use)
             await self.embedding_service.store_embeddings(chunks)
             
-            # Step 4: Process each question
-            all_answers = []
-            all_metadata = []
-            
-            for i, question in enumerate(request.questions):
+            # Step 4: Process each question concurrently
+            async def process_single_question(i, question, metadata):
                 logger.info("Processing question", index=i+1, question=question[:100])
-                
-                # Retrieve relevant context (currently returns empty)
-                #context_chunks = await self._retrieve_context(question, metadata.document_id)
-                context_chunks = await self.embedding_service.search_similar(query=question,top_k=3,document_id=metadata.document_id)
-                
-                # Answer question
+                context_chunks = await self.embedding_service.search_similar(query=question, top_k=3, document_id=metadata.document_id)
                 answer_result = await self.llm_service.answer_question_fast(question, context_chunks, metadata.document_id)
-                
-                all_answers.append(answer_result["answer"])
-                all_metadata.append({
-                    "question_index": i,
-                    "confidence": answer_result["confidence"],
-                    "sources": answer_result["sources"],
-                    "reasoning": answer_result["reasoning"],
-                    "token_usage": answer_result.get("token_usage", 0)
-                })
-            
+                return {
+                    "answer": answer_result["answer"],
+                    "metadata": {
+                        "question_index": i,
+                        "confidence": answer_result["confidence"],
+                        "sources": answer_result["sources"],
+                        "reasoning": answer_result["reasoning"],
+                        "token_usage": answer_result.get("token_usage", 0)
+                    }
+                }
+
+            tasks = [process_single_question(i, question, metadata) for i, question in enumerate(request.questions)]
+            results = await asyncio.gather(*tasks)
+            all_answers = [r["answer"] for r in results]
+            all_metadata = [r["metadata"] for r in results]
+
             # Calculate processing metrics
             processing_time = time.time() - start_time
             total_tokens = sum(meta.get("token_usage", 0) for meta in all_metadata)
