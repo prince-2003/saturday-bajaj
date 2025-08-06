@@ -5,13 +5,12 @@ import time
 
 from app.core.security import verify_api_key
 from app.models.schemas import QueryRequest, QueryResponse, ErrorResponse
-from app.services.retrieval_service import RetrievalService
+from app.core.container import get_retrieval_service
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
-# Initialize retrieval service
-retrieval_service = RetrievalService()
+# No need to initialize service here - it's managed by the container
 
 @router.post("/hackrx/run", 
              response_model=QueryResponse,
@@ -64,6 +63,7 @@ async def run_hackrx_query(
             )
         
         # Process the query
+        retrieval_service = get_retrieval_service()
         response = await retrieval_service.process_query(request)
         
         processing_time = time.time() - start_time
@@ -154,6 +154,7 @@ async def batch_process_questions(
                 detail="Maximum 100 questions allowed for batch processing"
             )
         
+        retrieval_service = get_retrieval_service()
         results = await retrieval_service.batch_process_optimized(questions, document_url)
         
         return {
@@ -185,6 +186,7 @@ async def get_performance_stats(api_key: str = Depends(verify_api_key)) -> Dict[
         Detailed performance metrics for all system components
     """
     try:
+        retrieval_service = get_retrieval_service()
         stats = retrieval_service.get_comprehensive_stats()
         return {
             "status": "success",
@@ -211,6 +213,7 @@ async def clear_system_cache(api_key: str = Depends(verify_api_key)) -> Dict[str
         Cache clearing status
     """
     try:
+        retrieval_service = get_retrieval_service()
         await retrieval_service.clear_all_caches()
         return {
             "status": "success",
@@ -242,6 +245,7 @@ async def warm_up_system(
     try:
         logger.info("System warm-up requested", documents=len(documents))
         
+        retrieval_service = get_retrieval_service()
         await retrieval_service.warm_up_system(documents)
         
         return {

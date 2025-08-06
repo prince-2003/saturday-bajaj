@@ -16,12 +16,29 @@ logger = structlog.get_logger(__name__)
 class RetrievalService:
     """Main service orchestrating document processing, retrieval, and question answering."""
     
-    def __init__(self):
-        self.document_processor = DocumentProcessor()
-        self.embedding_service = EmbeddingService()
-        self.cache_service = IntelligentCacheService()
-        self.database_service = DatabaseService()
-        self.llm_service = OptimizedLLMService(self.cache_service)
+    def __init__(self, 
+                 document_processor: DocumentProcessor = None,
+                 embedding_service: EmbeddingService = None,
+                 llm_service: OptimizedLLMService = None,
+                 cache_service: IntelligentCacheService = None,
+                 database_service: DatabaseService = None):
+        """
+        Initialize RetrievalService with injected dependencies.
+        
+        Args:
+            document_processor: Document processing service
+            embedding_service: Embedding and vector search service
+            llm_service: LLM service for question answering
+            cache_service: Caching service
+            database_service: Database service
+        """
+        # Use dependency injection if services are provided, otherwise create new instances
+        # This allows backward compatibility while supporting centralized initialization
+        self.document_processor = document_processor or DocumentProcessor()
+        self.embedding_service = embedding_service or EmbeddingService()
+        self.cache_service = cache_service or IntelligentCacheService()
+        self.database_service = database_service or DatabaseService()
+        self.llm_service = llm_service or OptimizedLLMService(self.cache_service)
         self.document_chunks_cache = {}  # In-memory cache for document chunks
     
     async def process_query(self, request: QueryRequest) -> QueryResponse:
@@ -71,7 +88,7 @@ class RetrievalService:
             response_metadata = {
                 "processing_time": round(processing_time, 2),
                 "total_tokens": total_tokens,
-                "document_metadata": metadata.dict(),
+                "document_metadata": metadata.model_dump(),
                 "question_metadata": all_metadata,
                 "avg_confidence": round(sum(meta["confidence"] for meta in all_metadata) / len(all_metadata), 3)
             }

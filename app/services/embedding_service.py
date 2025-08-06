@@ -13,9 +13,15 @@ logger = structlog.get_logger(__name__)
 class EmbeddingService:
     """Manages embeddings operations using OpenAI."""
     
-    def __init__(self):
+    def __init__(self, qdrant_service: QdrantService = None):
+        """
+        Initialize EmbeddingService with optional dependency injection.
+        
+        Args:
+            qdrant_service: Optional QdrantService instance for dependency injection
+        """
         self.openai_client = None
-        self.qdrant_service = QdrantService()
+        self.qdrant_service = qdrant_service or QdrantService()
         self._initialize_clients()
     
     def _initialize_clients(self):

@@ -5,13 +5,12 @@ import structlog
 from app.core.config import settings
 from app.core.security import verify_api_key
 from app.models.schemas import HealthResponse
-from app.services.retrieval_service import RetrievalService
+from app.core.container import get_retrieval_service
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
-# Initialize retrieval service for health checks
-retrieval_service = RetrievalService()
+# No need to initialize service here - it's managed by the container
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
@@ -23,6 +22,7 @@ async def health_check() -> HealthResponse:
     """
     try:
         # Basic health check
+        retrieval_service = get_retrieval_service()
         health_data = await retrieval_service.health_check()
         
         # Determine overall status
@@ -66,6 +66,7 @@ async def detailed_health_check(api_key: str = Depends(verify_api_key)) -> dict:
         logger.info("Detailed health check requested")
         
         # Get service health status
+        retrieval_service = get_retrieval_service()
         service_health = await retrieval_service.health_check()
         
         # Configuration status (without sensitive values)
