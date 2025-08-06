@@ -7,21 +7,18 @@ from openai import AsyncOpenAI
 from app.core.config import settings
 from app.models.schemas import EmbeddingChunk
 from app.services.qdrant_service import QdrantService
+from app.services.cache_service import IntelligentCacheService
 
 logger = structlog.get_logger(__name__)
 
 class EmbeddingService:
     """Manages embeddings operations using OpenAI."""
     
-    def __init__(self, qdrant_service: QdrantService = None):
-        """
-        Initialize EmbeddingService with optional dependency injection.
-        
-        Args:
-            qdrant_service: Optional QdrantService instance for dependency injection
-        """
+    def __init__(self, qdrant_service: QdrantService = None, cache_service: IntelligentCacheService = None):
         self.openai_client = None
         self.qdrant_service = qdrant_service or QdrantService()
+        self.cache_service = cache_service or IntelligentCacheService()
+        
         self._initialize_clients()
     
     def _initialize_clients(self):
@@ -38,22 +35,43 @@ class EmbeddingService:
             logger.error("Failed to initialize clients", error=str(e))
     
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for a list of texts."""
+        """Generate embeddings for a list of texts, with caching."""
         if not self.openai_client:
             raise ValueError("OpenAI client not initialized")
         
         try:
-            logger.info("Generating embeddings", text_count=len(texts))
+            embeddings_map = {}
+            texts_to_embed = []
             
-            response = await self.openai_client.embeddings.create(
-                model=settings.openai_embedding_model,
-                input=texts
-            )
+            # First, check the cache for each text
+            for text in texts:
+                cached_embedding = await self.cache_service.get_embedding_cache(text)
+                if cached_embedding:
+                    embeddings_map[text] = cached_embedding
+                else:
+                    texts_to_embed.append(text)
             
-            embeddings = [embedding.embedding for embedding in response.data]
-            logger.info("Generated embeddings successfully", embedding_count=len(embeddings))
-            
-            return embeddings
+            logger.info("Embedding cache check", hits=len(embeddings_map), misses=len(texts_to_embed))
+
+            # If there are any texts that were not in the cache, embed them in a batch
+            if texts_to_embed:
+                response = await self.openai_client.embeddings.create(
+                    model=settings.openai_embedding_model,
+                    input=texts_to_embed
+                )
+                
+                new_embeddings = [embedding.embedding for embedding in response.data]
+                
+                # Add new embeddings to the map and set them in the cache
+                for text, embedding in zip(texts_to_embed, new_embeddings):
+                    embeddings_map[text] = embedding
+                    await self.cache_service.set_embedding_cache(text, embedding)
+                
+                logger.info("Generated and cached new embeddings", count=len(texts_to_embed))
+
+            # Return the embeddings in the original order
+            final_embeddings = [embeddings_map[text] for text in texts]
+            return final_embeddings
         
         except Exception as e:
             logger.error("Failed to generate embeddings", error=str(e))

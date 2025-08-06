@@ -50,21 +50,28 @@ class ServiceContainer:
         logger.info("ServiceContainer initialized successfully")
     
     def _initialize_services(self):
-        """Initialize all services in the correct dependency order."""
+        """Initialize all services and wire up circular dependencies."""
         try:
             logger.info("Initializing core services...")
             
-            # 1. Initialize basic services first (no dependencies)
+            # --- Phase 1: Initialize all services ---
             self._services['document_processor'] = DocumentProcessor()
             self._services['qdrant_service'] = QdrantService()
             self._services['database_service'] = DatabaseService()
             self._services['cache_service'] = IntelligentCacheService()
-            
-            # 2. Initialize services with dependencies
-            self._services['embedding_service'] = EmbeddingService(self._services['qdrant_service'])
+            self._services['embedding_service'] = EmbeddingService(
+                qdrant_service=self._services['qdrant_service'],
+                cache_service=self._services['cache_service']
+            )
             self._services['llm_service'] = OptimizedLLMService(self._services['cache_service'])
             
-            # 3. Initialize high-level orchestration services (import dynamically to avoid circular imports)
+            # --- Phase 2: Inject circular dependencies (THE FIX) ---
+            # Now that embedding_service is created, give it to the cache_service
+            # This is the crucial missing step.
+            self._services['cache_service'].set_embedding_service(self._services['embedding_service'])
+            logger.info("Circular dependency wired: CacheService -> EmbeddingService")
+
+            # --- Phase 3: Initialize the top-level retrieval service ---
             from app.services.retrieval_service import RetrievalService
             self._services['retrieval_service'] = RetrievalService(
                 document_processor=self._services['document_processor'],
@@ -74,9 +81,7 @@ class ServiceContainer:
                 database_service=self._services['database_service']
             )
             
-            logger.info("All services initialized successfully", 
-                       service_count=len(self._services),
-                       services=list(self._services.keys()))
+            logger.info("All services initialized and wired successfully")
                        
         except Exception as e:
             logger.error("Failed to initialize services", error=str(e))

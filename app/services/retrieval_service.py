@@ -10,7 +10,8 @@ from app.services.cache_service import IntelligentCacheService
 from app.services.database_service import DatabaseService
 from app.services.qdrant_service import QdrantService
 from app.models.schemas import QueryRequest, QueryResponse, DocumentMetadata
-import hashlib # Add this import at the top of the file
+import hashlib 
+
 
 logger = structlog.get_logger(__name__)
 
@@ -41,14 +42,13 @@ class RetrievalService:
         self.database_service = database_service or DatabaseService()
         self.llm_service = llm_service or OptimizedLLMService(self.cache_service)
         self.document_chunks_cache = {}  # In-memory cache for document chunks
-    
+
     async def process_query(self, request: QueryRequest) -> QueryResponse:
         """
-        Process a complete query request with document and questions, with intelligent caching.
+        Process a complete query request with document and questions, with intelligent caching and batching.
         """
         start_time = time.time()
         document_url = str(request.documents)
-
         document_id = hashlib.md5(document_url.encode()).hexdigest()[:12]
 
         try:
@@ -57,32 +57,49 @@ class RetrievalService:
                         document_id=document_id,
                         question_count=len(request.questions))
 
-            # Step 2: Check if the document has already been processed and stored in Qdrant.
+            # Step 1: Check if the document has already been processed and stored in Qdrant.
             is_processed = await self.embedding_service.qdrant_service.document_exists(document_id=document_id)
             
             if not is_processed:
                 logger.info("CACHE MISS: Document not found in Qdrant. Processing for the first time.", document_id=document_id)
-                
-                # --- This block runs only for new documents ---
-                
-                # 1. Process, chunk, and get metadata. The document_id will be consistent.
                 metadata, chunks = await self.document_processor.process_document(document_url)
-                
-                # 2. Store the new embeddings in Qdrant for future use.
                 await self.embedding_service.store_embeddings(chunks)
                 logger.info("New document processed and stored in Qdrant.", document_id=document_id)
-            
             else:
                 logger.info("CACHE HIT: Document found in Qdrant. Skipping processing and embedding.", document_id=document_id)
-                # We can create a placeholder metadata object since we're skipping processing
                 metadata = DocumentMetadata(document_id=document_id, document_type="pdf", total_pages=None, total_chunks=None, processing_time=0)
 
-            # Step 3: Process each question concurrently. This will now work for both new and existing documents.
-            async def process_single_question(i, question, doc_id):
+            # --- PERFORMANCE OPTIMIZATION: BATCH EMBEDDING GENERATION ---
+
+            # Step 2: Collect all questions and generate embeddings in a single batch.
+            all_questions = [q for q in request.questions]
+            logger.info("Generating embeddings for all questions in one batch", count=len(all_questions))
+            
+            # This makes ONE efficient API call to OpenAI instead of N calls.
+            question_embeddings = await self.embedding_service.generate_embeddings(all_questions)
+
+            # Create a lookup map for easy access to each question's embedding.
+            embedding_map = {question: emb for question, emb in zip(all_questions, question_embeddings)}
+
+            # --- END OF OPTIMIZATION ---
+
+            # Step 3: Process each question concurrently using the pre-fetched embeddings.
+            async def process_single_question_optimized(i, question, doc_id):
                 logger.info("Processing question", index=i+1, question=question[:100])
-                # The search is correctly filtered by the deterministic document_id
-                context_chunks = await self.embedding_service.search_similar(query=question, top_k=3, document_id=doc_id)
+
+                # Get the pre-generated embedding from our map. No new API call here.
+                query_embedding = embedding_map[question]
+                
+                # Call the Qdrant service directly for the vector search. This is fast.
+                context_chunks = await self.embedding_service.qdrant_service.search_similar(
+                    query_embedding=query_embedding, 
+                    top_k=3, 
+                    document_id=doc_id
+                )
+                
+                # The LLM call remains the same.
                 answer_result = await self.llm_service.answer_question_fast(question, context_chunks, doc_id)
+                
                 return {
                     "answer": answer_result["answer"],
                     "metadata": {
@@ -94,12 +111,12 @@ class RetrievalService:
                     }
                 }
 
-            tasks = [process_single_question(i, question, document_id) for i, question in enumerate(request.questions)]
+            tasks = [process_single_question_optimized(i, question, document_id) for i, question in enumerate(request.questions)]
             results = await asyncio.gather(*tasks)
             all_answers = [r["answer"] for r in results]
             all_metadata = [r["metadata"] for r in results]
 
-            # ... (rest of the metrics calculation and response formatting logic is fine) ...
+            # The rest of your metrics and response formatting logic remains the same
             processing_time = time.time() - start_time
             total_tokens = sum(meta.get("token_usage", 0) for meta in all_metadata)
             
@@ -119,7 +136,7 @@ class RetrievalService:
             
         except Exception as e:
             logger.error("Query processing failed", error=str(e), exc_info=True)
-            raise ValueError(f"Query processing failed: {str(e)}")
+            raise ValueError(f"Query processing failed: {str(e)}")    
     async def _retrieve_context(self, question: str, document_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Retrieve relevant context for a question."""
         try:
