@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     chunk_size: int = 1500  # Larger chunks for better context
     chunk_overlap: int = 300
     max_chunks_per_document: int = 200
+    max_paragraph_chunk_size: int = 1000  # Maximum size for paragraph chunks
+    min_chunk_size: int = 100  # Minimum size for chunks
     
     # Performance Settings (Optimized)
     max_concurrent_requests: int = 50

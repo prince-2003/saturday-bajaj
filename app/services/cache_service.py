@@ -2,15 +2,17 @@ import asyncio
 import json
 import hashlib
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 import structlog
 import redis.asyncio as redis
-from cachetools import TTLCache, LRUCache
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from cachetools import TTLCache, LRUCache
 
 from app.core.config import settings
 from app.models.schemas import EmbeddingChunk
+
+if TYPE_CHECKING:
+    from app.services.embedding_service import EmbeddingService
 
 logger = structlog.get_logger(__name__)
 
@@ -23,15 +25,16 @@ class IntelligentCacheService:
         self.document_cache = TTLCache(maxsize=100, ttl=settings.document_cache_ttl)
         self.embedding_cache = TTLCache(maxsize=500, ttl=settings.embedding_cache_ttl)
         self.qa_cache = TTLCache(maxsize=200, ttl=settings.qa_cache_ttl)
-        
-        # Semantic similarity model for cache matching
-        self.similarity_model = None
-        self.semantic_cache = {}  # question_embedding -> answer
+        self.embedding_service: Optional["EmbeddingService"] = None
         
         self._initialize_cache()
     
+    def set_embedding_service(self, embedding_service: "EmbeddingService"):
+        """Set the embedding service after initialization to avoid circular imports."""
+        self.embedding_service = embedding_service
+    
     def _initialize_cache(self):
-        """Initialize Redis connection and similarity model."""
+        """Initialize Redis connection."""
         try:
             # Check if using Upstash REST API
             if settings.upstash_redis_rest_url and settings.upstash_redis_rest_token:
@@ -62,23 +65,12 @@ class IntelligentCacheService:
                 )
                 self.use_upstash = False
             
-            # Initialize similarity model for semantic caching
-            asyncio.create_task(self._load_similarity_model())
-            
             logger.info("Cache service initialized successfully")
             
         except Exception as e:
             logger.error("Failed to initialize cache service", error=str(e))
             self.redis_client = None
             self.use_upstash = False
-    
-    async def _load_similarity_model(self):
-        """Load sentence transformer model for semantic similarity."""
-        try:
-            self.similarity_model = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("Semantic similarity model loaded")
-        except Exception as e:
-            logger.error("Failed to load similarity model", error=str(e))
     
     async def _upstash_get(self, key: str) -> Optional[str]:
         """Get value from Upstash using REST API."""
@@ -226,51 +218,49 @@ class IntelligentCacheService:
             logger.error("Error caching embedding", error=str(e))
     
     async def get_qa_cache(self, question: str, document_id: str) -> Optional[Dict[str, Any]]:
-        """Get cached Q&A result with semantic similarity matching."""
+        """Get cached Q&A result with exact and semantic matching, using a two-layer cache."""
         try:
-            # Direct cache lookup
             cache_key = self._generate_cache_key("qa", question, document_id)
             
-            # Check memory cache first
+            # --- FIX: Check in-memory cache first ---
             if cache_key in self.qa_cache:
-                logger.info("Q&A cache hit (exact)", question=question[:50])
+                logger.info("Q&A cache hit (exact in-memory)", question=question[:50])
                 return self.qa_cache[cache_key]
-            
-            # Check Redis cache
+
+            # 2. Exact match check in Redis
             if self.redis_client:
                 cached_answer = await self.redis_client.get(cache_key)
                 if cached_answer:
-                    answer = json.loads(cached_answer)
-                    self.qa_cache[cache_key] = answer
                     logger.info("Q&A cache hit (exact Redis)", question=question[:50])
+                    answer = json.loads(cached_answer)
+                    # Populate the in-memory cache for the next request
+                    self.qa_cache[cache_key] = answer
                     return answer
-            
-            # Semantic similarity check
-            if self.similarity_model:
+
+            # 3. Semantic similarity check (if no exact match is found)
+            if self.embedding_service:
                 similar_answer = await self._check_semantic_cache(question, document_id)
                 if similar_answer:
                     logger.info("Q&A cache hit (semantic)", question=question[:50])
+                    # Populate both caches for the next time this exact question is asked
+                    await self.set_qa_cache(question, document_id, similar_answer)
                     return similar_answer
             
             logger.info("Q&A cache miss", question=question[:50])
             return None
-            
         except Exception as e:
             logger.error("Error accessing Q&A cache", error=str(e))
             return None
     
     async def set_qa_cache(self, question: str, document_id: str, answer_data: Dict[str, Any]):
-        """Cache Q&A result."""
+        """Cache Q&A result for both exact and semantic lookups in both cache layers."""
         try:
             cache_key = self._generate_cache_key("qa", question, document_id)
             
-            # Add timestamp
-            answer_data["cached_at"] = time.time()
-            
-            # Store in memory cache
+            # --- FIX: Set in-memory cache ---
             self.qa_cache[cache_key] = answer_data
-            
-            # Store in Redis cache
+
+            # 2. Set exact match in Redis
             if self.redis_client:
                 await self.redis_client.setex(
                     cache_key,
@@ -278,80 +268,13 @@ class IntelligentCacheService:
                     json.dumps(answer_data, default=str)
                 )
             
-            # Store in semantic cache
-            if self.similarity_model:
+            # 3. Add to semantic cache (this part is correct)
+            if self.embedding_service:
                 await self._add_to_semantic_cache(question, document_id, answer_data)
             
             logger.info("Q&A cached successfully", question=question[:50])
-            
         except Exception as e:
             logger.error("Error caching Q&A", error=str(e))
-    
-    async def _check_semantic_cache(self, question: str, document_id: str) -> Optional[Dict[str, Any]]:
-        """Check for semantically similar cached questions."""
-        try:
-            if not self.similarity_model:
-                return None
-            
-            # Get question embedding
-            question_embedding = self.similarity_model.encode([question])[0]
-            
-            # Check semantic cache for similar questions
-            semantic_key = f"semantic:{document_id}"
-            if self.redis_client:
-                cached_questions = await self.redis_client.hgetall(semantic_key)
-                
-                for cached_q, cached_data in cached_questions.items():
-                    cached_info = json.loads(cached_data)
-                    cached_embedding = np.array(cached_info["embedding"])
-                    
-                    # Calculate similarity
-                    similarity = np.dot(question_embedding, cached_embedding) / (
-                        np.linalg.norm(question_embedding) * np.linalg.norm(cached_embedding)
-                    )
-                    
-                    if similarity >= settings.semantic_cache_threshold:
-                        logger.info("Semantic cache match found", 
-                                   similarity=similarity, 
-                                   original_question=cached_q[:50])
-                        return cached_info["answer"]
-            
-            return None
-            
-        except Exception as e:
-            logger.error("Error checking semantic cache", error=str(e))
-            return None
-    
-    async def _add_to_semantic_cache(self, question: str, document_id: str, answer_data: Dict[str, Any]):
-        """Add question-answer pair to semantic cache."""
-        try:
-            if not self.similarity_model or not self.redis_client:
-                return
-            
-            # Generate question embedding
-            question_embedding = self.similarity_model.encode([question])[0]
-            
-            # Prepare semantic cache entry
-            semantic_data = {
-                "question": question,
-                "embedding": question_embedding.tolist(),
-                "answer": answer_data,
-                "timestamp": time.time()
-            }
-            
-            # Store in Redis hash for document
-            semantic_key = f"semantic:{document_id}"
-            await self.redis_client.hset(
-                semantic_key,
-                question,
-                json.dumps(semantic_data, default=str)
-            )
-            
-            # Set expiration for semantic cache
-            await self.redis_client.expire(semantic_key, settings.qa_cache_ttl)
-            
-        except Exception as e:
-            logger.error("Error adding to semantic cache", error=str(e))
     
     async def get_vector_cache(self, query_vector: List[float], document_id: str) -> Optional[List[Dict[str, Any]]]:
         """Get cached vector search results."""
@@ -400,8 +323,7 @@ class IntelligentCacheService:
             "document_cache_size": len(self.document_cache),
             "embedding_cache_size": len(self.embedding_cache),
             "qa_cache_size": len(self.qa_cache),
-            "redis_connected": self.redis_client is not None,
-            "semantic_model_loaded": self.similarity_model is not None
+            "redis_connected": self.redis_client is not None
         }
         
         if self.redis_client:
@@ -453,3 +375,45 @@ class IntelligentCacheService:
                 logger.error("Error warming cache for document", url=doc_url, error=str(e))
         
         logger.info("Cache warm-up completed")
+
+    async def _check_semantic_cache(self, question: str, document_id: str) -> Optional[Dict[str, Any]]:
+        """Check for semantically similar cached questions using OpenAI embeddings."""
+        try:
+            # Get question embedding from OpenAI via the EmbeddingService
+            embeddings = await self.embedding_service.generate_embeddings([question])
+            if not embeddings: return None
+            question_embedding = np.array(embeddings[0])
+            
+            semantic_key = f"semantic:{document_id}"
+            if self.redis_client:
+                cached_questions = await self.redis_client.hgetall(semantic_key)
+                for cached_q, cached_data in cached_questions.items():
+                    cached_info = json.loads(cached_data)
+                    cached_embedding = np.array(cached_info["embedding"])
+                    
+                    similarity = np.dot(question_embedding, cached_embedding) / (np.linalg.norm(question_embedding) * np.linalg.norm(cached_embedding))
+                    
+                    if similarity >= settings.semantic_cache_threshold:
+                        logger.info("Semantic cache match found", similarity=round(similarity, 2), original_question=cached_q[:50])
+                        return cached_info["answer"]
+            return None
+        except Exception as e:
+            logger.error("Error checking semantic cache", error=str(e))
+            return None
+
+    async def _add_to_semantic_cache(self, question: str, document_id: str, answer_data: Dict[str, Any]):
+        """Add question-answer pair to semantic cache using OpenAI embeddings."""
+        try:
+            # Generate question embedding from OpenAI via the EmbeddingService
+            embeddings = await self.embedding_service.generate_embeddings([question])
+            if not embeddings: return
+            question_embedding = embeddings[0]
+            
+            semantic_data = {"embedding": question_embedding, "answer": answer_data}
+            
+            semantic_key = f"semantic:{document_id}"
+            if self.redis_client:
+                await self.redis_client.hset(semantic_key, question, json.dumps(semantic_data, default=str))
+                await self.redis_client.expire(semantic_key, settings.qa_cache_ttl)
+        except Exception as e:
+            logger.error("Error adding to semantic cache", error=str(e))

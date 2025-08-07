@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime
 import uuid
+from sqlalchemy import text # Add this import
 
 from app.core.config import settings
 
@@ -264,15 +265,18 @@ class DatabaseService:
             logger.error("Failed to get query history", error=str(e))
             return []
     
+    # In database_service.py
+
     async def health_check(self) -> str:
         """Check database service health."""
         if not self.engine:
             return "unhealthy"
-        
+
         try:
             # Test database connection
             with self.engine.connect() as connection:
-                connection.execute("SELECT 1")
+                # Wrap the raw SQL string in the text() function
+                connection.execute(text("SELECT 1")) # THE FIX IS HERE
             return "healthy"
         except Exception as e:
             logger.error("Database health check failed", error=str(e))

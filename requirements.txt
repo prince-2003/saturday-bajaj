@@ -18,7 +18,6 @@ tiktoken==0.5.1
 
 # Vector database and embeddings (let pip resolve compatible versions)
 qdrant-client==1.7.3
-sentence-transformers>=2.2.0,<3.0.0
 
 # Caching
 redis==5.0.1
