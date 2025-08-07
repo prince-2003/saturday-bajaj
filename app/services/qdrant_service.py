@@ -78,7 +78,31 @@ class QdrantService:
         except Exception as e:
             logger.error("Failed to create collection", error=str(e), collection=collection_name)
             return False
-    
+
+    async def collection_exists(self, collection_name: str = None) -> bool:
+        """Check if collection exists."""
+        if not self.client:
+            logger.error("Qdrant client not initialized")
+            return False
+            
+        collection_name = collection_name or settings.qdrant_collection_name
+
+        try:
+            collections_response = await self.client.get_collections()
+            existing_collections = [col.name for col in collections_response.collections]
+            exists = collection_name in existing_collections
+            
+            logger.debug("Collection existence check", 
+                        collection=collection_name, 
+                        exists=exists)
+            return exists
+            
+        except Exception as e:
+            logger.error("Failed to check collection existence", 
+                        error=str(e), 
+                        collection=collection_name)
+            return False
+
     async def store_embeddings(self, chunks: List[EmbeddingChunk], collection_name: str = None) -> bool:
         """Store embeddings in Qdrant."""
         if not self.client:
@@ -225,21 +249,25 @@ class QdrantService:
             return
             
         try:
+            # Import the correct PayloadSchemaType from qdrant_client
+            from qdrant_client.models import PayloadSchemaType
+            
             collection_info = await self.client.get_collection(collection_name=collection_name)
+            
             # Check if the index already exists in the payload schema
-            if field_name not in (collection_info.payload_schema or {}):
+            existing_indexes = collection_info.payload_schema or {}
+            if field_name not in existing_indexes:
+                # Use the correct PayloadSchemaType enum
+                schema_type = PayloadSchemaType.KEYWORD if field_schema.lower() == "keyword" else PayloadSchemaType.INTEGER
+                
                 await self.client.create_payload_index(
                     collection_name=collection_name,
                     field_name=field_name,
-                    #
-                    # === THE FIX IS HERE ===
-                    #
-                    # BEFORE (WRONG): field_schema=PayloadSchemaType(field_schema.upper())
-                    #
-                    # AFTER (CORRECT): Pass the string directly
-                    field_schema=field_schema
+                    field_schema=schema_type
                 )
-                logger.info("Created payload index", field=field_name, collection=collection_name)
+                logger.info("Created payload index", field=field_name, collection=collection_name, schema=field_schema)
+            else:
+                logger.info("Payload index already exists", field=field_name, collection=collection_name)
         except Exception as e:
             logger.warning(f"Could not ensure payload index for '{field_name}'", error=str(e))
             
@@ -297,6 +325,13 @@ class QdrantService:
         collection_name = collection_name or settings.qdrant_collection_name
 
         try:
+            # Ensure collection and index exist before checking
+            await self.create_collection(collection_name)
+            
+            # Add a small delay to ensure index is ready
+            import asyncio
+            await asyncio.sleep(0.1)
+            
             # The count API is the most efficient way to check for existence
             count_result = await self.client.count(
                 collection_name=collection_name,
@@ -309,11 +344,16 @@ class QdrantService:
             )
 
             exists = count_result.count > 0
-            logger.info("Checked document existence in Qdrant", document_id=document_id, exists=exists)
+            logger.info("Checked document existence in Qdrant", document_id=document_id, exists=exists, count=count_result.count)
             return exists
 
         except Exception as e:
-            # This can happen if the collection doesn't exist yet, which is fine on the first run.
+            # If index doesn't exist yet, the document definitely doesn't exist
+            if "Index required" in str(e) or "not found" in str(e):
+                logger.info("Index not ready yet, assuming document does not exist", document_id=document_id)
+                return False
+            
+            # For other errors, log and assume document doesn't exist
             logger.warning("Could not check document existence, assuming it does not exist.", error=str(e))
             return False
 

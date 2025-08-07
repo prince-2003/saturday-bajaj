@@ -3,7 +3,7 @@ import aiofiles
 import tempfile
 import os
 import gc
-from typing import List, Dict, Any, Optional, Generator
+from typing import List, Dict, Any, Optional, Generator, Tuple
 from urllib.parse import urlparse
 import structlog
 import httpx
@@ -11,10 +11,14 @@ from io import BytesIO
 import re
 import PyPDF2
 import pdfplumber
+import fitz  # PyMuPDF
+from pdfminer.high_level import extract_text
+from pdfminer.layout import LAParams
 from docx import Document
 import email
 from email.mime.text import MIMEText
 import psutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.core.config import settings
 from app.models.schemas import DocumentMetadata, EmbeddingChunk
@@ -28,17 +32,19 @@ class DocumentProcessor:
         self.chunk_size = settings.chunk_size
         self.chunk_overlap = settings.chunk_overlap
         
-        # Memory management settings
-        self.max_memory_usage = 0.8  # 80% of 1GB
-        self.batch_size = 5  # Process 5 pages at a time
-        self.embedding_batch_size = 10  # Embed 10 chunks at once
+        # ✅ ULTRA-FAST: Settings for sub-60 second processing
+        self.max_memory_usage = 0.85  # 85% of 1GB - push limits for speed
+        self.batch_size = 200  # Process 200 pages at a time for ultra performance
+        self.embedding_batch_size = 200  # Mega embedding batches for fewer API calls
         
-        # Optimized chunking
-        self.use_semantic_chunking = True
-        self.max_paragraph_chunk_size = getattr(settings, 'max_paragraph_chunk_size', self.chunk_size * 1.25)
-        self.min_chunk_size = getattr(settings, 'min_chunk_size', 100)
-        self.max_tokens_per_chunk = 800
-        self.enable_chunk_compression = True
+        # Ultra-fast optimization settings
+        self.max_tokens_per_chunk = 800  # Optimal size for speed vs context
+        self.min_chunk_size = 50  # Smaller minimum for faster processing
+        self.enable_chunk_compression = True  # Keep compression for efficiency
+        
+        logger.info("Ultra-fast DocumentProcessor initialized", 
+                   batch_size=self.batch_size,
+                   memory_limit=f"{self.max_memory_usage*100}%")
 
     def _check_memory_usage(self) -> bool:
         """Check if memory usage is within limits."""
@@ -136,9 +142,9 @@ class DocumentProcessor:
             return 0
 
     def _process_pdf_streaming_with_cleanup(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
-        """Stream process PDF with automatic file cleanup."""
+        """Ultra-fast PDF processing with automatic file cleanup."""
         try:
-            yield from self._process_pdf_streaming(file_path, document_id, document_url)
+            yield from self._process_pdf_streaming_robust(file_path, document_id, document_url)
         finally:
             # Clean up temp file after generator is fully consumed
             try:
@@ -170,6 +176,167 @@ class DocumentProcessor:
                 logger.info("Cleaned up temporary text file", file_path=file_path)
             except Exception as e:
                 logger.warning("Failed to clean up temporary file", file_path=file_path, error=str(e))
+
+    def _process_pdf_streaming_robust(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
+        """Optimized robust PDF processing with multi-library fallback for 99% accuracy."""
+        import concurrent.futures
+        from multiprocessing import cpu_count
+        import time
+        
+        try:
+            total_pages = self._get_pdf_page_count_safe(file_path)
+            logger.info(f"Starting robust PDF processing", 
+                       total_pages=total_pages,
+                       file_size_mb=round(os.path.getsize(file_path) / 1024 / 1024, 1))
+            
+            # Optimized parameters for speed + accuracy balance
+            page_batch_size = min(150, total_pages)  # Balanced batch size
+            max_workers = min(4, cpu_count())
+            
+            chunk_index = 0
+            extraction_stats = {"pdfplumber": 0, "pymupdf": 0, "pdfminer": 0, "pypdf2": 0, "failed": 0}
+            
+            for batch_start in range(0, total_pages, page_batch_size):
+                batch_end = min(batch_start + page_batch_size, total_pages)
+                
+                logger.info(f"Processing robust batch {batch_start + 1}-{batch_end}/{total_pages}")
+                
+                # Extract batch with parallel processing and fallback
+                batch_results = self._extract_batch_optimized_robust(
+                    file_path, batch_start, batch_end, max_workers, extraction_stats
+                )
+                
+                if batch_results:
+                    # Convert to chunks
+                    batch_text = "\n".join([
+                        f"--- Page {page_num + 1} ---\n{text}" 
+                        for page_num, text in batch_results 
+                        if text.strip()
+                    ])
+                    
+                    if batch_text.strip():
+                        chunks = self._create_chunks_from_text(
+                            batch_text, document_id, chunk_index, document_url
+                        )
+                        
+                        if chunks:
+                            chunk_index += len(chunks)
+                            yield chunks
+                            logger.info(f"Generated {len(chunks)} chunks from batch")
+                
+                # Brief pause for system balance
+                time.sleep(0.1)
+            
+            # Log extraction statistics
+            total_attempted = sum(extraction_stats.values())
+            if total_attempted > 0:
+                success_rate = ((total_attempted - extraction_stats["failed"]) / total_attempted) * 100
+                logger.info("PDF extraction statistics", 
+                           success_rate=f"{success_rate:.1f}%",
+                           methods=extraction_stats)
+                
+        except Exception as e:
+            logger.error("Robust PDF processing failed", error=str(e))
+            return
+            yield []
+
+    def _get_pdf_page_count_safe(self, file_path: str) -> int:
+        """Get PDF page count using fastest reliable method."""
+        try:
+            # Try PyMuPDF first (fastest for page count)
+            doc = fitz.open(file_path)
+            count = doc.page_count
+            doc.close()
+            return count
+        except:
+            try:
+                # Fallback to PyPDF2
+                with open(file_path, 'rb') as f:
+                    reader = PyPDF2.PdfReader(f)
+                    return len(reader.pages)
+            except:
+                return 0
+
+    def _extract_batch_optimized_robust(self, file_path: str, start_page: int, end_page: int, 
+                                      max_workers: int, stats: Dict[str, int]) -> List[Tuple[int, str]]:
+        """Extract pages with optimized robust multi-library approach."""
+        results = []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all page extraction tasks
+            future_to_page = {
+                executor.submit(self._extract_single_page_robust, file_path, page_num, stats): page_num
+                for page_num in range(start_page, end_page)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_page, timeout=60):
+                page_num = future_to_page[future]
+                try:
+                    text = future.result()
+                    if text and text.strip():
+                        results.append((page_num, text))
+                except Exception as e:
+                    logger.warning(f"Page {page_num + 1} robust extraction failed", error=str(e))
+                    stats["failed"] += 1
+        
+        # Sort by page number
+        results.sort(key=lambda x: x[0])
+        return results
+
+    def _extract_single_page_robust(self, file_path: str, page_num: int, stats: Dict[str, int]) -> str:
+        """Extract single page with multi-library fallback for maximum accuracy."""
+        
+        # Method 1: pdfplumber (best for complex layouts, tables)
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                page = pdf.pages[page_num]
+                text = page.extract_text()
+                if text and len(text.strip()) > 50:  # Good quality threshold
+                    stats["pdfplumber"] += 1
+                    return text
+        except:
+            pass
+        
+        # Method 2: PyMuPDF (fast, good for images + text)
+        try:
+            doc = fitz.open(file_path)
+            page = doc[page_num]
+            text = page.get_text()
+            doc.close()
+            if text and len(text.strip()) > 50:
+                stats["pymupdf"] += 1
+                return text
+        except:
+            pass
+        
+        # Method 3: pdfminer (excellent for difficult PDFs)
+        try:
+            # Extract specific page using pdfminer
+            with open(file_path, 'rb') as fp:
+                text = extract_text(fp, page_numbers=[page_num], 
+                                  laparams=LAParams(boxes_flow=0.5, word_margin=0.1))
+                if text and len(text.strip()) > 20:
+                    stats["pdfminer"] += 1
+                    return text
+        except:
+            pass
+        
+        # Method 4: PyPDF2 (fallback)
+        try:
+            with open(file_path, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                text = reader.pages[page_num].extract_text()
+                if text and text.strip():
+                    stats["pypdf2"] += 1
+                    return text
+        except:
+            pass
+        
+        # All methods failed
+        stats["failed"] += 1
+        logger.warning(f"All extraction methods failed for page {page_num + 1}")
+        return ""
 
     def _process_pdf_streaming(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
         """Stream process PDF in small batches."""

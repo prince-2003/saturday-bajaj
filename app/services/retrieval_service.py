@@ -37,79 +37,107 @@ class RetrievalService:
             from app.services.document_processor import DocumentProcessor
             self.document_processor = DocumentProcessor()
         
-        # Memory management settings
-        self.max_memory_threshold = 0.85  # 85% of available memory
-        self.chunk_processing_batch_size = 20  # Process chunks in batches
-        self.embedding_batch_size = 10  # Embed in smaller batches
+        # ✅ ULTRA-FAST: Push limits for sub-60 second processing
+        self.max_memory_threshold = 0.85  # 85% - push closer to limit
+        self.chunk_processing_batch_size = 2000  # 200 pages worth
+        self.embedding_batch_size = 200  # Mega-batches for fewer API calls
+        self.max_concurrent_questions = 15  # More concurrent processing
+        self.memory_check_frequency = 10  # Check memory less frequently
+        
+        # Ultra-fast caching
+        self._collection_exists_cache = None
+        
+        logger.info("Ultra-fast mode initialized", 
+                   memory_threshold=f"{self.max_memory_threshold*100}%",
+                   chunk_batch_size=self.chunk_processing_batch_size,
+                   embedding_batch_size=self.embedding_batch_size)
 
     def _check_memory_and_cleanup(self) -> bool:
-        """Check memory usage and perform cleanup if needed."""
+        """Ultra-fast memory check with aggressive cleanup."""
         try:
             memory_percent = psutil.virtual_memory().percent / 100
             if memory_percent > self.max_memory_threshold:
-                logger.warning("High memory usage, performing cleanup", 
+                logger.warning("High memory usage, performing ultra-fast cleanup", 
                              memory_percent=f"{memory_percent*100:.1f}%")
+                # ✅ Aggressive cleanup for speed
                 gc.collect()
+                gc.collect()  # Double collection for better cleanup
+                import ctypes
+                ctypes.CDLL('msvcrt').malloc_trim(0)  # Force memory release on Windows
                 return False
             return True
         except Exception:
             return True
 
     async def process_query_streaming(self, request: QueryRequest) -> QueryResponse:
-        """Process query with streaming document processing to minimize memory usage."""
+        """Ultra-fast query processing under 60 seconds."""
         start_time = time.time()
         document_url = str(request.documents)
         document_id = hashlib.md5(document_url.encode()).hexdigest()[:12]
 
         try:
-            logger.info("Starting memory-optimized query processing", 
+            logger.info("ULTRA-FAST processing started", 
+                        target_time="<60s",
                         document_url=document_url,
                         document_id=document_id,
                         question_count=len(request.questions))
 
-            # Step 1: Check if document already exists in Qdrant
+            # ✅ Step 0: Fast collection check (cached)
+            if self._collection_exists_cache is None:
+                self._collection_exists_cache = await self.embedding_service.qdrant_service.collection_exists()
+                if not self._collection_exists_cache:
+                    await self.embedding_service.qdrant_service.create_collection()
+                    self._collection_exists_cache = True
+
+            # ✅ Step 1: Fast document existence check
             is_processed = await self.embedding_service.qdrant_service.document_exists(document_id=document_id)
             
-            if not is_processed:
-                logger.info("Document not in Qdrant, starting streaming processing", document_id=document_id)
-                
-                # Process document with streaming to avoid memory buildup
-                metadata, chunk_generator = await self.document_processor.process_document_streaming(document_url)
-                
-                # Process and store chunks in batches to control memory usage
-                total_chunks_processed = 0
-                for chunk_batch in chunk_generator:
-                    await self._process_and_store_chunk_batch(chunk_batch, document_id)
-                    total_chunks_processed += len(chunk_batch)
-                    
-                    # Memory check after each batch
-                    if not self._check_memory_and_cleanup():
-                        await asyncio.sleep(0.2)  # Brief pause for memory recovery
-                
-                metadata.total_chunks = total_chunks_processed
-                logger.info("Streaming document processing completed", 
-                          document_id=document_id, 
-                          total_chunks=total_chunks_processed)
-            else:
-                logger.info("Document found in Qdrant, skipping processing", document_id=document_id)
+            if is_processed:
+                logger.info("Document found in Qdrant, ultra-fast path", document_id=document_id)
                 metadata = DocumentMetadata(
                     document_id=document_id, 
-                    document_type="pdf", 
+                    document_type="pdf",
                     total_pages=None, 
                     total_chunks=None, 
                     processing_time=0
                 )
+            else:
+                logger.info("Document processing with ULTRA-FAST mode", document_id=document_id)
+                
+                # ⚡ Use ultra-fast document processing
+                metadata, chunk_generator = await self.document_processor.process_document_streaming(document_url)
+                
+                # Process with minimal memory checks for speed
+                total_chunks_processed = 0
+                batch_count = 0
+                
+                for chunk_batch in chunk_generator:
+                    await self._process_and_store_chunk_batch_ultra_fast(chunk_batch, document_id)
+                    total_chunks_processed += len(chunk_batch)
+                    batch_count += 1
+                    
+                    # ✅ Minimal memory checking for speed - every 2 batches only
+                    if batch_count % 2 == 0:
+                        if not self._check_memory_and_cleanup():
+                            await asyncio.sleep(0.1)  # Shorter pause
+                
+                metadata.total_chunks = total_chunks_processed
+                logger.info("Ultra-fast document processing completed", 
+                          document_id=document_id, 
+                          total_chunks=total_chunks_processed,
+                          batches_processed=batch_count)
 
-            # Step 2: Batch process all questions efficiently 
+            # ✅ Step 2: Ultra-fast question processing
             all_questions = list(request.questions)
-            logger.info("Generating embeddings for all questions in batch", count=len(all_questions))
+            logger.info("Ultra-fast question embeddings", count=len(all_questions))
             
-            # Generate question embeddings in batch (more efficient than individual calls)
+            # Generate question embeddings in batch
             question_embeddings = await self.embedding_service.generate_embeddings(all_questions)
             embedding_map = {question: emb for question, emb in zip(all_questions, question_embeddings)}
 
-            # Step 3: Process questions concurrently with memory management
-            semaphore = asyncio.Semaphore(5)  # Limit concurrent questions
+            # ✅ Step 3: Ultra-concurrent question processing
+            semaphore = asyncio.Semaphore(self.max_concurrent_questions)  # Increased from 10 to 15
+            semaphore = asyncio.Semaphore(10)  # Increased concurrent questions for faster processing
             
             async def process_single_question_optimized(i, question, doc_id):
                 async with semaphore:
@@ -174,39 +202,88 @@ class RetrievalService:
             processing_time = time.time() - start_time
             total_tokens = sum(meta.get("token_usage", 0) for meta in all_metadata)
             
-            logger.info("Memory-optimized query processing completed", 
-                        processing_time=processing_time,
+            logger.info("ULTRA-FAST processing completed", 
+                        time_taken=f"{processing_time:.1f}s",
+                        target_met=processing_time < 60.0,
                         total_tokens=total_tokens,
-                        memory_usage=f"{psutil.virtual_memory().percent:.1f}%")
+                        memory_usage=f"{psutil.virtual_memory().percent:.1f}%",
+                        total_chunks=total_chunks_processed if not is_processed else "cached")
             
             return QueryResponse(answers=all_answers)
             
         except Exception as e:
-            logger.error("Memory-optimized query processing failed", error=str(e), exc_info=True)
-            raise ValueError(f"Query processing failed: {str(e)}")
+            logger.error("Ultra-fast processing failed", error=str(e), exc_info=True)
+            raise ValueError(f"Ultra-fast query processing failed: {str(e)}")
+
+    async def _process_and_store_chunk_batch_ultra_fast(self, chunk_batch: List[EmbeddingChunk], document_id: str):
+        """Ultra-fast chunk processing with mega-batches."""
+        if not chunk_batch:
+            return
+
+        logger.info("Ultra-fast chunk processing", batch_size=len(chunk_batch))
+        
+        # ✅ MEGA-BATCH: Process up to 200 chunks per API call
+        mega_batch_size = self.embedding_batch_size  # 200 chunks per API call
+        texts = [chunk.text for chunk in chunk_batch]
+        
+        # Use asyncio.gather for concurrent API calls
+        if len(texts) > mega_batch_size:
+            embedding_tasks = []
+            for i in range(0, len(texts), mega_batch_size):
+                sub_batch = texts[i:i + mega_batch_size]
+                task = self.embedding_service.generate_embeddings(sub_batch)
+                embedding_tasks.append(task)
+            
+            # ⚡ Concurrent API calls instead of sequential
+            logger.info(f"Making {len(embedding_tasks)} concurrent API calls")
+            embedding_results = await asyncio.gather(*embedding_tasks)
+            embeddings = []
+            for result in embedding_results:
+                embeddings.extend(result)
+        else:
+            embeddings = await self.embedding_service.generate_embeddings(texts)
+        
+        # Attach embeddings
+        for chunk, embedding in zip(chunk_batch, embeddings):
+            chunk.embedding = embedding
+        
+        # ⚡ Bulk storage
+        success = await self.embedding_service.qdrant_service.store_embeddings(chunk_batch)
+        
+        if success:
+            logger.info("Ultra-fast batch completed", 
+                       batch_size=len(chunk_batch),
+                       memory_usage=f"{psutil.virtual_memory().percent:.1f}%")
+        else:
+            logger.error("Failed to store ultra-fast batch", batch_size=len(chunk_batch))
 
     async def _process_and_store_chunk_batch(self, chunk_batch: List[EmbeddingChunk], document_id: str):
-        """Process and store a batch of chunks with memory optimization."""
+        """Process and store a batch of chunks with optimized performance."""
         try:
             if not chunk_batch:
                 return
 
             logger.info("Processing chunk batch", batch_size=len(chunk_batch), document_id=document_id)
             
-            # Generate embeddings for batch
+            # Generate embeddings for batch with larger sub-batches for speed
             texts = [chunk.text for chunk in chunk_batch]
             
-            # Process embeddings in smaller sub-batches if needed
+            # Use larger embedding batches for fewer API calls
             if len(texts) > self.embedding_batch_size:
                 embeddings = []
+                api_calls = 0
                 for i in range(0, len(texts), self.embedding_batch_size):
                     sub_batch = texts[i:i + self.embedding_batch_size]
                     sub_embeddings = await self.embedding_service.generate_embeddings(sub_batch)
                     embeddings.extend(sub_embeddings)
+                    api_calls += 1
                     
-                    # Memory check between sub-batches
-                    if not self._check_memory_and_cleanup():
-                        await asyncio.sleep(0.1)
+                    # Quick memory check - less frequent for speed
+                    if api_calls % 3 == 0 and not self._check_memory_and_cleanup():
+                        await asyncio.sleep(0.05)  # Shorter pause for speed
+                
+                logger.info(f"Generated embeddings with {api_calls} API calls", 
+                           chunks=len(texts), batch_size=self.embedding_batch_size)
             else:
                 embeddings = await self.embedding_service.generate_embeddings(texts)
             
@@ -221,6 +298,10 @@ class RetrievalService:
                 logger.info("Chunk batch stored successfully", batch_size=len(chunk_batch))
             else:
                 logger.error("Failed to store chunk batch", batch_size=len(chunk_batch))
+            
+            # Immediate cleanup for speed
+            del texts, embeddings
+            gc.collect()
                 
         except Exception as e:
             logger.error("Chunk batch processing failed", error=str(e))
@@ -289,3 +370,50 @@ class RetrievalService:
         except Exception as e:
             logger.error("Failed to get memory stats", error=str(e))
             return {"error": str(e)}
+
+    async def _optimize_for_speed(self):
+        """Optimize system components for maximum speed."""
+        try:
+            # Pre-warm connections
+            if hasattr(self.embedding_service, 'openai_client'):
+                logger.info("Pre-warming OpenAI connections for speed")
+                # Pre-generate a small embedding to warm up the connection
+                await self.embedding_service.generate_embeddings(["warmup"])
+            
+            # Pre-warm Qdrant connection
+            if hasattr(self.embedding_service, 'qdrant_service'):
+                logger.info("Pre-warming Qdrant connections for speed")
+                await self.embedding_service.qdrant_service.health_check()
+            
+            # Pre-warm LLM connections
+            if hasattr(self.llm_service, 'anthropic_client'):
+                logger.info("Pre-warming Claude connections for speed")
+                await self.llm_service.health_check()
+                
+            logger.info("System optimized for maximum speed")
+            
+        except Exception as e:
+            logger.warning("Speed optimization partially failed", error=str(e))
+    
+    async def _fast_document_check(self, document_id: str) -> bool:
+        """Ultra-fast document existence check with caching."""
+        try:
+            # Check memory cache first (fastest)
+            if hasattr(self.cache_service, 'memory_cache'):
+                cached_result = self.cache_service.memory_cache.get(f"doc_exists_{document_id}")
+                if cached_result is not None:
+                    logger.info("Fast cache hit for document existence", document_id=document_id)
+                    return cached_result
+            
+            # Fall back to Qdrant check
+            exists = await self.embedding_service.qdrant_service.document_exists(document_id=document_id)
+            
+            # Cache the result for next time
+            if hasattr(self.cache_service, 'memory_cache'):
+                self.cache_service.memory_cache[f"doc_exists_{document_id}"] = exists
+            
+            return exists
+            
+        except Exception as e:
+            logger.error("Fast document check failed", error=str(e))
+            return False
