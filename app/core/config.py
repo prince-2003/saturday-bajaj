@@ -36,7 +36,8 @@ class Settings(BaseSettings):
     document_processing_timeout: int = 180  # 3 minutes for document processing
     
     # Embedding Configuration
-    embedding_dimension: int = 1536  # OpenAI embedding dimension
+    # Embedding Configuration
+    embedding_dimension: int = 3072  # text-embedding-3-large dimension (was 1536 for ada-002)
     
     # Qdrant Configuration (Primary Vector DB)
     qdrant_url: Optional[str] = None

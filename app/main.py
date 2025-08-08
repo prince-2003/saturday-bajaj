@@ -84,7 +84,12 @@ async def timeout_middleware(request, call_next):
         return response
     except asyncio.TimeoutError:
         logger.error("Request timeout", path=request.url.path)
-        return HTTPException(status_code=504, detail="Request timeout")
+        from fastapi import HTTPException
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Request timeout - processing took longer than 5 minutes"}
+        )
     except Exception as e:
         logger.error("Middleware error", error=str(e))
         raise

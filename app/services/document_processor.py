@@ -3,88 +3,135 @@ import aiofiles
 import tempfile
 import os
 import gc
-from typing import List, Dict, Any, Optional, Generator, Tuple
+import psutil
+from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple
 from urllib.parse import urlparse
 import structlog
 import httpx
 from io import BytesIO
 import re
+from multiprocessing import cpu_count
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+
 import PyPDF2
 import pdfplumber
-import fitz  # PyMuPDF
-from pdfminer.high_level import extract_text
-from pdfminer.layout import LAParams
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+try:
+    from pdfminer.high_level import extract_text as pdfminer_extract_text
+except ImportError:
+    pdfminer_extract_text = None
+
 from docx import Document
 import email
 from email.mime.text import MIMEText
-import psutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.core.config import settings
 from app.models.schemas import DocumentMetadata, EmbeddingChunk
 
 logger = structlog.get_logger(__name__)
 
-class DocumentProcessor:
-    """Memory-optimized document processor with streaming and batch processing."""
+class OptimizedDocumentProcessor:
+    """
+    🚀 PRODUCTION-OPTIMIZED Document Processor with Memory Management
+    
+    Features:
+    - Advanced text compression and chunking
+    - Smart paragraph-based processing
+    - Aggressive memory cleanup
+    - Multi-threaded PDF processing with timeouts
+    - RAM usage monitoring and cleanup
+    """
 
     def __init__(self):
         self.chunk_size = settings.chunk_size
         self.chunk_overlap = settings.chunk_overlap
-        # 🚀 PRODUCTION OPTIMIZED: 800MB memory available
-        self.max_memory_usage = 0.90  # 90% of 800MB = 720MB usable
-        self.batch_size = 400  # DOUBLED: 400 pages at once (was 150)
-        self.embedding_batch_size = 500  # MASSIVE: 500 embeddings per API call (was 200)
-        # Ultra-fast optimization settings for production
-        self.max_tokens_per_chunk = 1200  # Increased for testing - was 800
-        self.min_chunk_size = 50  # Smaller minimum for faster processing
-        self.enable_chunk_compression = True  # Keep compression for efficiency
-        logger.info("PRODUCTION DocumentProcessor initialized", 
+        
+        # 🚀 PRODUCTION OPTIMIZED: 800MB memory available - USE FULL 800MB!
+        self.max_memory_usage = 1.00  # 100% of 800MB = 800MB fully utilized
+        self.batch_size = 800  # MASSIVE: 800 pages at once (increased from 200)
+        self.embedding_batch_size = 250  # MAXIMUM: 250 embeddings per API call (increased from 150)
+        self.max_workers = min(32, cpu_count() * 4)  # Maximum workers for full utilization
+        
+        # Cost-optimized chunking configuration
+        self.use_semantic_chunking = True
+        self.max_paragraph_chunk_size = getattr(settings, 'max_paragraph_chunk_size', self.chunk_size * 1.25)
+        self.min_chunk_size = getattr(settings, 'min_chunk_size', 100)
+        self.preserve_section_boundaries = True
+        
+        # Cost control settings
+        self.max_tokens_per_chunk = 800
+        self.enable_chunk_compression = True
+        
+        logger.info("PRODUCTION DocumentProcessor initialized - MAXIMUM 800MB USAGE", 
                    batch_size=self.batch_size,
-                   memory_limit=f"{self.max_memory_usage*100}%",
-                   memory_available="800MB")
+                   memory_limit=f"{self.max_memory_usage*100:.0f}%",
+                   memory_available="800MB - FULL UTILIZATION",
+                   max_workers=self.max_workers,
+                   embedding_batch_size=self.embedding_batch_size)
 
     def _check_memory_usage(self) -> bool:
-        """Check if memory usage is within limits."""
+        """Check if memory usage is within limits with cleanup."""
         try:
             memory_percent = psutil.virtual_memory().percent / 100
             if memory_percent > self.max_memory_usage:
-                logger.warning("High memory usage detected", 
-                             memory_percent=f"{memory_percent*100:.1f}%")
-                gc.collect()  # Force garbage collection
+                logger.warning("Memory limit exceeded, forcing cleanup", 
+                              current=f"{memory_percent*100:.1f}%",
+                              limit=f"{self.max_memory_usage*100:.1f}%")
+                # Force aggressive cleanup
+                gc.collect()
                 return False
             return True
-        except Exception:
-            return True  # If can't check, assume OK
+        except Exception as e:
+            logger.warning("Memory check failed", error=str(e))
+            return True  # Continue processing if memory check fails
+
+    def _force_memory_cleanup(self, context: str = ""):
+        """Force aggressive memory cleanup."""
+        try:
+            before = psutil.virtual_memory().percent
+            gc.collect()  # Force garbage collection
+            after = psutil.virtual_memory().percent
+            logger.info(f"Memory cleanup completed {context}", 
+                       before=f"{before:.1f}%",
+                       after=f"{after:.1f}%",
+                       freed=f"{before-after:.1f}%")
+        except Exception as e:
+            logger.warning("Memory cleanup failed", error=str(e))
 
     async def download_document(self, url: str) -> bytes:
-        """Download document with memory-efficient streaming."""
+        """Download document from URL with memory monitoring."""
         try:
+            logger.info("Starting document download", url=url[:100])
             # 🚀 PRODUCTION: Increase timeout for larger files (800MB memory = bigger files)
-            async with httpx.AsyncClient(timeout=120.0) as client:  # Doubled from 60s
-                async with client.stream('GET', url) as response:
-                    response.raise_for_status()
-                    
-                    # Stream download to avoid loading entire file in memory
-                    content = BytesIO()
-                    async for chunk in response.aiter_bytes(chunk_size=8192):
-                        content.write(chunk)
-                        
-                        # Check memory during download
-                        if not self._check_memory_usage():
-                            await asyncio.sleep(0.1)  # Brief pause
-                    
-                    return content.getvalue()
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                
+                content = response.content
+                logger.info("Document downloaded successfully", 
+                           size_mb=round(len(content) / 1024 / 1024, 1))
+                return content
+                
         except Exception as e:
             logger.error("Failed to download document", url=url, error=str(e))
             raise ValueError(f"Failed to download document: {str(e)}")
 
-    async def process_document_streaming(self, url: str) -> tuple[DocumentMetadata, Generator[List[EmbeddingChunk], None, None]]:
-        """Process document with streaming chunks to avoid memory buildup."""
+    async def process_document_streaming(self, url: str) -> tuple[DocumentMetadata, AsyncGenerator[List[EmbeddingChunk], None]]:
+        """
+        🚀 STAGED PROCESSING: Process document with aggressive memory management
+        
+        Stage 1: Download and process all chunks in memory
+        Stage 2: Yield chunks in batches with cleanup between batches
+        """
         logger.info("Starting streaming document processing", url=url)
         
         # Download document
         document_content = await self.download_document(url)
+        document_id = self._generate_document_id(url)
         
         # Determine file type
         parsed_url = urlparse(url)
@@ -98,406 +145,393 @@ class DocumentProcessor:
             else:
                 file_extension = '.txt'
 
+        # Create temporary file
         with tempfile.NamedTemporaryFile(suffix=file_extension, delete=False) as temp_file:
             temp_file.write(document_content)
             temp_file_path = temp_file.name
 
-        # Don't use try-finally here since we need the file to exist during generator consumption
-        document_id = self._generate_document_id(url)
-        
-        if file_extension == '.pdf':
-            chunk_generator = self._process_pdf_streaming_with_cleanup(temp_file_path, document_id, url)
-            total_pages = await self._get_pdf_page_count(temp_file_path)
-        elif file_extension == '.docx':
-            chunk_generator = self._process_docx_streaming_with_cleanup(temp_file_path, document_id, url)
-            total_pages = None
-        else:
-            chunk_generator = self._process_text_streaming_with_cleanup(temp_file_path, document_id, url)
-            total_pages = None
-
-        metadata = DocumentMetadata(
-            document_id=document_id,
-            document_type=file_extension[1:],
-            total_pages=total_pages,
-            total_chunks=0,  # Will be updated as we process
-            processing_time=0.0
-        )
-        
-        # Clean up document content from memory
-        del document_content
-        gc.collect()
-        
-        logger.info("Document streaming setup complete", document_id=document_id)
-        
-        return metadata, chunk_generator
-
-    async def _get_pdf_page_count(self, file_path: str) -> int:
-        """Get PDF page count without loading full content."""
         try:
-            with open(file_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                return len(pdf_reader.pages)
-        except Exception:
-            return 0
+            logger.info("Document streaming setup complete", document_id=document_id)
+            
+            # STAGE 1: Process document into chunks with memory monitoring
+            if file_extension == '.pdf':
+                text_content, total_pages = await self._process_pdf_optimized(temp_file_path)
+            elif file_extension == '.docx':
+                text_content, total_pages = await self._process_docx(temp_file_path)
+            elif file_extension in ['.eml', '.msg']:
+                text_content, total_pages = await self._process_email(temp_file_path)
+            else:
+                async with aiofiles.open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    text_content = await f.read()
+                total_pages = None
 
-    def _process_pdf_streaming_with_cleanup(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
-        """Ultra-fast PDF processing with automatic file cleanup."""
-        try:
-            yield from self._process_pdf_streaming_robust(file_path, document_id, document_url)
+            # Create all chunks in memory first
+            all_chunks = self._create_chunks(text_content, url)
+            
+            # Clean up text content immediately
+            del text_content
+            self._force_memory_cleanup("after text processing")
+            
+            # Create metadata
+            metadata = DocumentMetadata(
+                document_id=document_id,
+                document_type=file_extension[1:],
+                total_pages=total_pages,
+                total_chunks=len(all_chunks),
+                processing_time=0.0
+            )
+            
+            logger.info("STAGED processing complete", 
+                       total_chunks=len(all_chunks),
+                       pages=total_pages)
+
+            # STAGE 2: Yield chunks in batches - MAXIMUM performance with full 800MB
+            async def chunk_generator():
+                batch_size = 100  # DOUBLED: Process 100 chunks at a time (was 50)
+                for i in range(0, len(all_chunks), batch_size):
+                    # Create a COPY of the batch to prevent reference issues
+                    batch = [chunk for chunk in all_chunks[i:i + batch_size]]
+                    yield batch
+                    
+                    # Minimal memory cleanup - only when absolutely necessary
+                    if i % (batch_size * 10) == 0:  # Every 10 batches (1000 chunks)
+                        memory_percent = psutil.virtual_memory().percent
+                        if memory_percent > 98:  # Only cleanup at 98% usage
+                            logger.info(f"Memory cleanup at batch {i//batch_size + 1}, memory: {memory_percent}%")
+                            gc.collect()  # Light garbage collection only
+
+            return metadata, chunk_generator()
+            
         finally:
-            # Clean up temp file after generator is fully consumed
+            # Clean up temporary file
             try:
-                os.unlink(file_path)
-                logger.info("Cleaned up temporary PDF file", file_path=file_path)
+                os.unlink(temp_file_path)
+                logger.info("Cleaned up temporary PDF file", file_path=temp_file_path)
             except Exception as e:
-                logger.warning("Failed to clean up temporary file", file_path=file_path, error=str(e))
+                logger.warning("Failed to clean up temp file", error=str(e))
 
-    def _process_docx_streaming_with_cleanup(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
-        """Stream process DOCX with automatic file cleanup."""
-        try:
-            yield from self._process_docx_streaming(file_path, document_id, document_url)
-        finally:
-            # Clean up temp file after generator is fully consumed
-            try:
-                os.unlink(file_path)
-                logger.info("Cleaned up temporary DOCX file", file_path=file_path)
-            except Exception as e:
-                logger.warning("Failed to clean up temporary file", file_path=file_path, error=str(e))
-
-    def _process_text_streaming_with_cleanup(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
-        """Stream process text with automatic file cleanup."""
-        try:
-            yield from self._process_text_streaming(file_path, document_id, document_url)
-        finally:
-            # Clean up temp file after generator is fully consumed
-            try:
-                os.unlink(file_path)
-                logger.info("Cleaned up temporary text file", file_path=file_path)
-            except Exception as e:
-                logger.warning("Failed to clean up temporary file", file_path=file_path, error=str(e))
-
-    def _process_pdf_streaming_robust(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
-        """Optimized robust PDF processing with multi-library fallback for 99% accuracy."""
-        import concurrent.futures
-        from multiprocessing import cpu_count
-        import time
-        
+    async def _process_pdf_optimized(self, file_path: str) -> tuple[str, int]:
+        """
+        🚀 ULTRA-OPTIMIZED PDF processing with memory management and multi-threading
+        """
+        batch_results = []  # Initialize at function scope
         try:
             total_pages = self._get_pdf_page_count_safe(file_path)
-            logger.info(f"Starting robust PDF processing", 
+            logger.info("ULTRA-FAST PDF processing started", 
                        total_pages=total_pages,
                        file_size_mb=round(os.path.getsize(file_path) / 1024 / 1024, 1))
             
-            # Optimized parameters for maximum speed
-            # 🚀 PRODUCTION OPTIMIZED: 800MB memory = larger batches & more workers
-            page_batch_size = min(600, total_pages)  # TRIPLE: 600 pages per batch (was 200)
-            max_workers = min(16, cpu_count() * 2)  # DOUBLE: 16 workers (was 8)
+            # 🚀 PRODUCTION: Process ALL pages in one massive batch
+            batch_results = self._extract_batch_ultra_fast(file_path, 0, total_pages, self.max_workers)
             
-            chunk_index = 0
-            extraction_stats = {"pdfplumber": 0, "pymupdf": 0, "pdfminer": 0, "pypdf2": 0, "failed": 0}
+            # Build text with memory monitoring - NEVER DELETE batch_results until we're done
+            logger.info("Building final text content", pages_processed=len(batch_results))
+            text_content = ""
+            successful_pages = 0
             
-            for batch_start in range(0, total_pages, page_batch_size):
-                batch_end = min(batch_start + page_batch_size, total_pages)
+            for page_num, text in batch_results:
+                if text.strip():
+                    text_content += f"\n--- Page {page_num + 1} ---\n{text}\n"
+                    successful_pages += 1
                 
-                logger.info(f"Processing robust batch {batch_start + 1}-{batch_end}/{total_pages} (workers: {max_workers})")
-                
-                try:
-                    # Extract batch with parallel processing and fallback
-                    batch_results = self._extract_batch_optimized_robust(
-                        file_path, batch_start, batch_end, max_workers, extraction_stats
-                    )
-                    
-                    logger.info(f"Batch extraction completed", 
-                               pages_processed=len(batch_results), 
-                               pages_expected=batch_end - batch_start)
-                    
-                    if batch_results:
-                        # Convert to chunks
-                        batch_text = "\n".join([
-                            f"--- Page {page_num + 1} ---\n{text}" 
-                            for page_num, text in batch_results 
-                            if text.strip()
-                        ])
-                        
-                        if batch_text.strip():
-                            chunks = self._create_chunks_from_text(
-                                batch_text, document_id, chunk_index, document_url
-                            )
-                            
-                            if chunks:
-                                chunk_index += len(chunks)
-                                yield chunks
-                                logger.info(f"Generated {len(chunks)} chunks from batch {batch_start + 1}-{batch_end}")
-                    else:
-                        logger.warning(f"No content extracted from batch {batch_start + 1}-{batch_end}")
-                        
-                except Exception as batch_error:
-                    logger.error(f"Batch {batch_start + 1}-{batch_end} processing failed", error=str(batch_error))
-                    # Continue with next batch instead of stopping
-                    continue
-                
-                # Brief pause for system balance and file handle cleanup (reduced for speed)
-                time.sleep(0.05)  # Reduced from 0.2s to 0.05s
+                # Memory check every 100 pages but don't break - we need all data
+                if page_num % 100 == 0:
+                    memory_percent = psutil.virtual_memory().percent
+                    if memory_percent > 95:  # Only stop if extremely critical
+                        logger.error(f"Critical memory usage {memory_percent}%, stopping text building")
+                        break
             
-            # Log extraction statistics
-            total_attempted = sum(extraction_stats.values())
-            if total_attempted > 0:
-                success_rate = ((total_attempted - extraction_stats["failed"]) / total_attempted) * 100
-                logger.info("PDF extraction statistics", 
-                           success_rate=f"{success_rate:.1f}%",
-                           methods=extraction_stats,
-                           total_pages=total_pages)
-                
-                # If success rate is very low, warn but continue
-                if success_rate < 30:
-                    logger.warning("Low extraction success rate", success_rate=f"{success_rate:.1f}%")
-            else:
-                logger.warning("No pages were processed successfully")
-                
+            # Calculate success rate
+            success_rate = successful_pages / total_pages * 100 if total_pages > 0 else 0
+            
+            logger.info("ULTRA-FAST PDF completed", 
+                       success_rate=f"{success_rate:.1f}%",
+                       total_pages=total_pages,
+                       successful_pages=successful_pages,
+                       text_length=len(text_content))
+            
+            # Only clean up AFTER we've built the text content
+            del batch_results
+            self._force_memory_cleanup("after PDF processing")
+            
+            # If we got very little text, try the fallback
+            if len(text_content.strip()) < 1000 and total_pages > 10:
+                logger.warning("PDF extraction yielded very little text, trying fallback")
+                return await self._process_pdf_simple(file_path)
+            
+            return text_content.strip(), total_pages
+            
         except Exception as e:
-            logger.error("Robust PDF processing failed completely", error=str(e))
-            # Don't return empty - let the system try fallback processing
-            logger.info("Attempting fallback to basic PDF processing...")
+            logger.error("ULTRA-FAST PDF processing failed", error=str(e))
+            # Clean up batch_results if it exists
+            if batch_results:
+                del batch_results
+            # Fallback to simple processing
             try:
-                # Fallback to basic pdfplumber processing
-                yield from self._process_pdf_streaming(file_path, document_id, document_url)
+                logger.info("Trying fallback PDF processing...")
+                return await self._process_pdf_simple(file_path)
             except Exception as fallback_error:
-                logger.error("Fallback processing also failed", error=str(fallback_error))
-                return
+                logger.error("All PDF processing methods failed", fallback_error=str(fallback_error))
+                return "", 0
 
-    def _get_pdf_page_count_safe(self, file_path: str) -> int:
-        """Get PDF page count using fastest reliable method."""
-        try:
-            # Try PyMuPDF first (fastest for page count)
-            doc = fitz.open(file_path)
-            count = doc.page_count
-            doc.close()
-            return count
-        except:
-            try:
-                # Fallback to PyPDF2
-                with open(file_path, 'rb') as f:
-                    reader = PyPDF2.PdfReader(f)
-                    return len(reader.pages)
-            except:
-                return 0
-
-    def _extract_batch_optimized_robust(self, file_path: str, start_page: int, end_page: int, 
-                                      max_workers: int, stats: Dict[str, int]) -> List[Tuple[int, str]]:
-        """Extract pages with optimized robust multi-library approach."""
+    def _extract_batch_ultra_fast(self, file_path: str, start_page: int, end_page: int, max_workers: int) -> List[Tuple[int, str]]:
+        """ULTRA-FAST batch extraction with memory monitoring."""
         results = []
         batch_size = end_page - start_page
         
-        # 🚀 PRODUCTION: Adjusted for larger batches (600 pages)
-        # 0.5 seconds per page minimum, 5 minutes maximum for huge batches
-        timeout = min(max(batch_size * 0.5, 60), 300)  # Increased max from 120s to 300s
+        # 🚀 PRODUCTION: Very generous timeout for maximum success rate
+        # 3.0 seconds per page minimum, 45 minutes maximum for complex PDFs
+        base_timeout_per_page = 3.0  # TRIPLED from 1.0 to 3.0 seconds per page
+        min_timeout = 600  # 10 minutes minimum (increased from 180s)
+        max_timeout = 2700  # 45 minutes maximum (increased from 1200s)
+        
+        timeout = min(max(batch_size * base_timeout_per_page, min_timeout), max_timeout)
+        
+        logger.info(f"Processing batch with {max_workers} workers, timeout: {timeout}s")
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all page extraction tasks
-            future_to_page = {
-                executor.submit(self._extract_single_page_robust, file_path, page_num, stats): page_num
-                for page_num in range(start_page, end_page)
-            }
+            future_to_page = {}
+            for page_num in range(start_page, end_page):
+                future = executor.submit(self._extract_single_page_fast, file_path, page_num)
+                future_to_page[future] = page_num
             
-            # Collect results as they complete with optimized timeout
+            # Collect results with more generous per-page timeout
             completed_futures = []
             try:
-                # Use timeout for as_completed to avoid hanging on slow pages
                 for future in as_completed(future_to_page, timeout=timeout):
-                    completed_futures.append(future)
-                    page_num = future_to_page[future]
                     try:
-                        text = future.result(timeout=2)  # Very short individual timeout
-                        if text and text.strip():
-                            results.append((page_num, text))
-                    except Exception as e:
-                        logger.debug(f"Page {page_num + 1} extraction failed/skipped", error=str(e))
-                        stats["failed"] += 1
-                        # Continue processing other pages
-            except Exception as e:
-                logger.warning(f"Batch timeout reached, processed {len(completed_futures)}/{len(future_to_page)} pages", 
-                             timeout=timeout, batch_size=batch_size)
-                
-                # Cancel remaining futures that haven't completed
-                for future in future_to_page:
-                    if not future.done():
-                        future.cancel()
                         page_num = future_to_page[future]
-                        logger.debug(f"Cancelled slow page {page_num + 1}")
-                        stats["failed"] += 1
+                        # Give each page up to 5 seconds to complete (increased from 2.0)
+                        text = future.result(timeout=5.0)  
+                        results.append((page_num, text))
+                        completed_futures.append(future)
+                        
+                        # Show progress every 100 pages
+                        if len(completed_futures) % 100 == 0:
+                            success_rate = len([r for r in results if r[1].strip()]) / len(results) * 100
+                            logger.info(f"Progress: {len(completed_futures)}/{len(future_to_page)} pages, "
+                                      f"success rate: {success_rate:.1f}%")
+                        
+                        # Only stop for critical memory issues (99% usage)
+                        if len(completed_futures) % 50 == 0:
+                            memory_percent = psutil.virtual_memory().percent
+                            if memory_percent > 99:  # Only stop if extremely critical
+                                logger.error(f"Critical memory {memory_percent}%, stopping batch processing")
+                                break
+                                
+                    except Exception as e:
+                        page_num = future_to_page[future]
+                        logger.debug(f"Page {page_num} extraction failed", error=str(e))
+                        results.append((page_num, ""))
+                        completed_futures.append(future)  # Still count as completed
+                        
+            except Exception as timeout_error:
+                logger.info(f"Batch processing completed: {len(completed_futures)}/{len(future_to_page)} pages processed")
+                # Don't log as error - partial processing is still valuable
+                
+                # Add empty results for unprocessed pages to maintain page order
+                processed_pages = {future_to_page[f] for f in completed_futures}
+                for page_num in range(start_page, end_page):
+                    if page_num not in processed_pages:
+                        results.append((page_num, ""))
         
-        # Sort by page number
+        # Sort results by page number
         results.sort(key=lambda x: x[0])
+        
+        # Memory cleanup
+        self._force_memory_cleanup("after batch processing")
+        
         return results
 
-    def _extract_single_page_robust(self, file_path: str, page_num: int, stats: Dict[str, int]) -> str:
-        """Extract single page with single fast method - skip blank pages quickly."""
+    def _extract_single_page_fast(self, file_path: str, page_num: int) -> str:
+        """Extract single page using the best available method."""
+        extraction_methods = []
         
-        # Only use pdfplumber - fastest and most reliable
-        try:
-            with pdfplumber.open(file_path) as pdf:
-                if page_num < len(pdf.pages):
-                    page = pdf.pages[page_num]
-                    text = page.extract_text()
-                    if text and len(text.strip()) > 3:  # Skip truly blank pages
-                        stats["pdfplumber"] += 1
-                        return text
-        except Exception:
-            pass  # Fail silently for speed
+        # Prioritize pdfplumber for quality
+        if pdfplumber:
+            extraction_methods.append(('pdfplumber', self._extract_with_pdfplumber))
         
-        # Page is blank or failed - skip quickly
-        stats["failed"] += 1
-        return ""  # Return empty string for blank pages
+        # Add other methods
+        if fitz:
+            extraction_methods.append(('pymupdf', self._extract_with_pymupdf))
+        if pdfminer_extract_text:
+            extraction_methods.append(('pdfminer', self._extract_with_pdfminer))
+        if PyPDF2:
+            extraction_methods.append(('pypdf2', self._extract_with_pypdf2))
+        
+        # Try each method
+        for method_name, extract_func in extraction_methods:
+            try:
+                return extract_func(file_path, page_num)
+            except Exception:
+                continue
+        
+        return ""  # All methods failed
 
-    def _process_pdf_streaming(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
-        """Stream process PDF in small batches."""
-        chunk_index = 0
+    def _extract_with_pdfplumber(self, file_path: str, page_num: int) -> str:
+        """Extract text using pdfplumber."""
+        with pdfplumber.open(file_path) as pdf:
+            if page_num < len(pdf.pages):
+                page = pdf.pages[page_num]
+                return page.extract_text() or ""
+        return ""
+
+    def _extract_with_pymupdf(self, file_path: str, page_num: int) -> str:
+        """Extract text using PyMuPDF."""
+        doc = fitz.open(file_path)
+        try:
+            if page_num < doc.page_count:
+                page = doc[page_num]
+                return page.get_text()
+        finally:
+            doc.close()
+        return ""
+
+    def _extract_with_pdfminer(self, file_path: str, page_num: int) -> str:
+        """Extract text using pdfminer."""
+        # pdfminer doesn't support single page extraction easily
+        return ""
+
+    def _extract_with_pypdf2(self, file_path: str, page_num: int) -> str:
+        """Extract text using PyPDF2."""
+        with open(file_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            if page_num < len(pdf_reader.pages):
+                page = pdf_reader.pages[page_num]
+                return page.extract_text() or ""
+        return ""
+
+    def _get_pdf_page_count_safe(self, file_path: str) -> int:
+        """Get PDF page count safely."""
+        try:
+            if pdfplumber:
+                with pdfplumber.open(file_path) as pdf:
+                    return len(pdf.pages)
+        except:
+            pass
+            
+        try:
+            if fitz:
+                doc = fitz.open(file_path)
+                count = doc.page_count
+                doc.close()
+                return count
+        except:
+            pass
+            
+        try:
+            if PyPDF2:
+                with open(file_path, 'rb') as file:
+                    pdf_reader = PyPDF2.PdfReader(file)
+                    return len(pdf_reader.pages)
+        except:
+            pass
+        
+        return 0
+
+    async def _process_pdf_simple(self, file_path: str) -> tuple[str, int]:
+        """Simple PDF processing fallback."""
+        text_content = ""
+        total_pages = 0
         
         try:
             with pdfplumber.open(file_path) as pdf:
                 total_pages = len(pdf.pages)
-                
-                for page_start in range(0, total_pages, self.batch_size):
-                    page_end = min(page_start + self.batch_size, total_pages)
-                    
-                    # Process batch of pages
-                    batch_text = ""
-                    for page_num in range(page_start, page_end):
-                        page = pdf.pages[page_num]
-                        page_text = page.extract_text()
-                        if page_text:
-                            batch_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
-                    
-                    if batch_text.strip():
-                        # Create chunks from batch
-                        batch_chunks = self._create_chunks_from_text(
-                            batch_text, document_id, chunk_index, document_url
-                        )
-                        chunk_index += len(batch_chunks)
-                        
-                        yield batch_chunks
-                        
-                        # Memory cleanup
-                        del batch_text, batch_chunks
-                        gc.collect()
-                        
-                        # Check memory and pause if needed
-                        if not self._check_memory_usage():
-                            import time
-                            time.sleep(0.5)
-                    
-                    logger.info("Processed PDF batch", 
-                              pages=f"{page_start+1}-{page_end}", 
-                              total_pages=total_pages)
-                              
+                for page_num, page in enumerate(pdf.pages):
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_content += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
         except Exception as e:
-            logger.error("PDF streaming processing failed", error=str(e))
-            # Return empty generator on error
-            return
-            yield []
+            logger.warning("Simple PDF processing failed", error=str(e))
+            
+        return text_content.strip(), total_pages
 
-    def _process_docx_streaming(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
-        """Stream process DOCX in batches."""
+    async def _process_docx(self, file_path: str) -> tuple[str, Optional[int]]:
+        """Process DOCX file and extract text with memory monitoring."""
         try:
             doc = Document(file_path)
-            batch_text = ""
-            chunk_index = 0
-            paragraph_count = 0
+            text_content = ""
             
+            # Process paragraphs
             for paragraph in doc.paragraphs:
                 if paragraph.text.strip():
-                    batch_text += paragraph.text + "\n"
-                    paragraph_count += 1
-                    
-                    # Process in batches of paragraphs
-                    if paragraph_count >= 20:  # Every 20 paragraphs
-                        if batch_text.strip():
-                            batch_chunks = self._create_chunks_from_text(
-                                batch_text, document_id, chunk_index, document_url
-                            )
-                            chunk_index += len(batch_chunks)
-                            yield batch_chunks
-                            
-                            # Cleanup
-                            del batch_chunks
-                            batch_text = ""
-                            paragraph_count = 0
-                            gc.collect()
+                    text_content += paragraph.text + "\n"
             
-            # Process remaining text
-            if batch_text.strip():
-                batch_chunks = self._create_chunks_from_text(
-                    batch_text, document_id, chunk_index, document_url
-                )
-                yield batch_chunks
-                
+            # Process tables
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = " | ".join([cell.text.strip() for cell in row.cells])
+                    if row_text.strip():
+                        text_content += row_text + "\n"
+            
+            # Memory cleanup
+            del doc
+            self._force_memory_cleanup("after DOCX processing")
+            
+            return text_content.strip(), None
+            
         except Exception as e:
-            logger.error("DOCX streaming processing failed", error=str(e))
-            return
-            yield []
+            logger.error("Failed to process DOCX", error=str(e))
+            raise ValueError(f"Failed to process DOCX: {str(e)}")
 
-    def _process_text_streaming(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
-        """Stream process text file in chunks."""
+    async def _process_email(self, file_path: str) -> tuple[str, Optional[int]]:
+        """Process email file and extract text."""
         try:
-            chunk_index = 0
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                # Read file in chunks to avoid memory issues
-                chunk_size = 8192  # 8KB chunks
-                text_buffer = ""
-                
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk:
-                        break
-                        
-                    text_buffer += chunk
-                    
-                    # Process when buffer gets large enough
-                    if len(text_buffer) >= self.chunk_size * 10:
-                        batch_chunks = self._create_chunks_from_text(
-                            text_buffer, document_id, chunk_index, document_url
-                        )
-                        chunk_index += len(batch_chunks)
-                        yield batch_chunks
-                        
-                        # Keep some overlap
-                        text_buffer = text_buffer[-self.chunk_overlap:]
-                        del batch_chunks
-                        gc.collect()
-                
-                # Process remaining buffer
-                if text_buffer.strip():
-                    batch_chunks = self._create_chunks_from_text(
-                        text_buffer, document_id, chunk_index, document_url
-                    )
-                    yield batch_chunks
-                    
+            with open(file_path, 'rb') as f:
+                msg = email.message_from_bytes(f.read())
+            
+            text_content = ""
+            text_content += f"From: {msg.get('From', 'Unknown')}\n"
+            text_content += f"To: {msg.get('To', 'Unknown')}\n"
+            text_content += f"Subject: {msg.get('Subject', 'No Subject')}\n"
+            text_content += f"Date: {msg.get('Date', 'Unknown')}\n\n"
+            
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        text_content += part.get_payload(decode=True).decode('utf-8', errors='ignore')
+            else:
+                text_content += msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+            
+            # Memory cleanup
+            del msg
+            self._force_memory_cleanup("after email processing")
+            
+            return text_content.strip(), None
+            
         except Exception as e:
-            logger.error("Text streaming processing failed", error=str(e))
-            return
-            yield []
+            logger.error("Failed to process email", error=str(e))
+            raise ValueError(f"Failed to process email: {str(e)}")
 
-    def _create_chunks_from_text(self, text: str, document_id: str, start_index: int, document_url: str) -> List[EmbeddingChunk]:
-        """Create chunks from text with memory optimization."""
+    def _create_chunks(self, text: str, document_url: str) -> List[EmbeddingChunk]:
+        """Create chunks from text content using cost-optimized paragraph-based strategy."""
         chunks = []
-        chunk_index = start_index
+        document_id = self._generate_document_id(document_url)
+        chunk_index = 0
         
         paragraphs = self._split_into_paragraphs(text)
+        
         current_chunk = ""
+        current_chunk_paragraphs = []
         
         for paragraph in paragraphs:
             paragraph = paragraph.strip()
             if not paragraph:
                 continue
                 
-            # Compress paragraph
+            # Compress paragraph if enabled
             if self.enable_chunk_compression:
                 paragraph = self._compress_text(paragraph)
             
             para_token_count = len(paragraph.split()) * 0.75
             current_token_count = len(current_chunk.split()) * 0.75
             
-            if current_token_count > 0 and (current_token_count + para_token_count > self.max_tokens_per_chunk):
+            # Check if we need to create a new chunk
+            if current_token_count > 0 and (
+                current_token_count + para_token_count > self.max_tokens_per_chunk or
+                len(current_chunk.split()) + len(paragraph.split()) > self.max_paragraph_chunk_size
+            ):
                 if current_chunk.strip() and len(current_chunk.split()) >= self.min_chunk_size:
                     chunk = self._create_chunk(
                         current_chunk.strip(), 
@@ -508,19 +542,34 @@ class DocumentProcessor:
                     chunks.append(chunk)
                     chunk_index += 1
                 
-                # Start new chunk with overlap
-                if self.chunk_overlap > 0:
-                    overlap_words = current_chunk.split()[-self.chunk_overlap//2:]
-                    current_chunk = " ".join(overlap_words) + "\n\n" + paragraph
+                # Handle overlap
+                if self.chunk_overlap > 0 and current_chunk_paragraphs:
+                    overlap_context = self._get_overlap_context(current_chunk_paragraphs[-1])
+                    current_chunk = overlap_context + "\n\n" + paragraph if overlap_context else paragraph
                 else:
                     current_chunk = paragraph
+                current_chunk_paragraphs = [paragraph]
             else:
                 if current_chunk:
                     current_chunk += "\n\n" + paragraph
                 else:
                     current_chunk = paragraph
+                current_chunk_paragraphs.append(paragraph)
+            
+            # MEMORY MONITORING: Check but don't stop - preserve data integrity
+            if len(chunks) % 50 == 0:
+                memory_percent = psutil.virtual_memory().percent
+                if memory_percent > 95:
+                    logger.error(f"Critical memory {memory_percent}% during chunking - continuing to preserve data", 
+                                chunks_created=len(chunks))
+                elif memory_percent > 90:
+                    logger.warning(f"High memory {memory_percent}% during chunking", 
+                                  chunks_created=len(chunks))
+                # Force cleanup every 200 chunks to prevent memory issues
+                if len(chunks) % 200 == 0:
+                    self._force_memory_cleanup(f"after {len(chunks)} chunks")
         
-        # Add final chunk
+        # Add the last chunk
         if current_chunk.strip() and len(current_chunk.split()) >= self.min_chunk_size:
             chunk = self._create_chunk(
                 current_chunk.strip(), 
@@ -530,45 +579,80 @@ class DocumentProcessor:
             )
             chunks.append(chunk)
         
+        # Memory cleanup - more aggressive
+        del paragraphs
+        if 'current_chunk_paragraphs' in locals():
+            del current_chunk_paragraphs
+        if 'current_chunk' in locals():
+            del current_chunk
+        self._force_memory_cleanup("after chunking")
+        
+        # Statistics (skip max calculation if no chunks to save memory)
+        if chunks:
+            total_tokens = sum(len(chunk.text.split()) * 0.75 for chunk in chunks)
+            avg_tokens_per_chunk = total_tokens / len(chunks)
+            # Skip expensive max calculation for performance
+            max_tokens = 0
+        else:
+            total_tokens = avg_tokens_per_chunk = max_tokens = 0
+        
+        logger.info("Created cost-optimized chunks", 
+                    total_chunks=len(chunks),
+                    estimated_total_tokens=int(total_tokens),
+                    avg_tokens_per_chunk=int(avg_tokens_per_chunk),
+                    max_tokens_per_chunk=int(max_tokens))
+        
         return chunks
 
     def _compress_text(self, text: str) -> str:
-        """Compress text by removing redundant phrases."""
-        # Enhanced compression patterns
+        """
+        Compresses text by replacing long, redundant phrases with shorter equivalents.
+        """
         replacement_map = {
-            # Insurance specific compressions
-            r'\bwhich shall be the basis of this contract and is deemed to be incorporated herein\b': '[contract basis]',
-            r'\bfollowing the Medical Advice of a duly qualified Medical Practitioner\b': 'per doctor advice',
-            r'\bThe Company shall indemnify the Hospital or the Insured, Reasonable and Customary Charges incurred for Medically Necessary Treatment\b': 'Company pays approved medical costs',
-            r'\bsubject to the Definitions, Terms, Exclusions, Conditions contained herein and limits\b': 'subject to policy terms',
-            r'\bhas applied to National Insurance Company Ltd\. \(hereinafter called the Company\)\b': 'applied to Company',
-            r'\bsudden, unforeseen and involuntary event caused by external, visible and violent means\b': '[Accident definition]',
-            r'\bunder the supervision of a registered and qualified medical practitioner\b': 'under qualified doctor supervision',
+            # General Legal & Insurance Phrases
+            r'\bwhich shall be the basis of this contract and is deemed to be incorporated herein\b': '[part of contract]',
+            r'\bfollowing the Medical Advice of a duly qualified Medical Practitioner\b': 'on a doctor\'s advice',
+            r'\bThe Company shall indemnify the Hospital or the Insured, Reasonable and Customary Charges incurred for Medically Necessary Treatment\b': 'Company will pay for approved medical costs',
+            r'\bThe Company shall not be liable to make any payment by the Policy, in respect of any expenses incurred in connection with or in respect of\b': 'Policy excludes payment for',
+            r'\bsubject to the Definitions, Terms, Exclusions, Conditions contained herein and limits\b': 'subject to policy terms and limits',
+            r'\bhas applied to National Insurance Company Ltd\. \(hereinafter called the Company\)\b': 'has applied to the Company',
+            r'\bsudden, unforeseen and involuntary event caused by external, visible and violent means\b': '[definition of Accident]',
+            r'\bunder the supervision of a registered and qualified medical practitioner\b': 'under a qualified doctor\'s supervision',
+            r'\b(shall be|are) accessible to the insurance company\'s authorized representative\b': 'accessible to the insurer',
             
-            # Generic legal phrase compression
-            r'\b(shall be|are) accessible to the insurance company\'s authorized representative\b': 'accessible to insurer',
-            r'\bIn the event of hospitalisation/ domiciliary hospitalisation, the insured person/insured person\'s representative shall notify\b': 'For hospitalization, notify',
+            # Specific recurring clauses
+            r'\bIn the event of hospitalisation/ domiciliary hospitalisation, the insured person/insured person\'s representative shall notify\b': 'For hospitalization, insured must notify',
             r'\b(for|under) any of the following circumstances\b': 'if:',
-            r'\bThe services offered by a TPA shall not include\b': 'TPA excludes:',
-            
-            # Remove redundant company info
-            r'National Insurance Co\. Ltd\.': 'NIC',
-            r'National Parivar Mediclaim Plus Policy': 'Policy',
-            r'UIN: NICHLIP25039V032425': '',
-            r'Page \d+ of \d+': '',
+            r'\bThe services offered by a TPA shall not include\b': 'TPA services exclude:',
+            r'\bThe policy shall be void and all premium paid thereon shall be forfeited to the Company\b': 'Policy will be voided',
+            r'\bin the event of misrepresentation, mis description or non-disclosure of any material fact\b': 'for any non-disclosure',
+
+            # Repeated Header/Footer info (can be removed entirely)
+            r'National Insurance Co\. Ltd\.': '',
             r'Premises No\. 18-0374, Plot no\. CBD-81, New Town, Kolkata - 700156': '',
+            r'National Parivar Mediclaim Plus Policy': '',
+            r'UIN: NICHLIP25039V032425': '',
+            r'Page \d+ of \d+': ''
         }
         
+        # Apply all replacements
         for pattern, replacement in replacement_map.items():
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
             
-        # Clean up excessive whitespace
+        # Final cleanup of excessive whitespace
         text = re.sub(r'\s+', ' ', text).strip()
+        
         return text
 
+    def _get_overlap_context(self, paragraph: str) -> str:
+        """Get smart overlap context - last sentence instead of full paragraph."""
+        sentences = paragraph.split('.')
+        if len(sentences) > 1:
+            return sentences[-2].strip() + '.' if sentences[-2].strip() else ''
+        return paragraph[:100] + '...' if len(paragraph) > 100 else paragraph
+
     def _split_into_paragraphs(self, text: str) -> List[str]:
-        """Split text into paragraphs with memory efficiency."""
-        # Simple split first
+        """Split text into meaningful paragraphs with enhanced logic."""
         paragraphs = text.split('\n\n')
         refined_paragraphs = []
         
@@ -577,7 +661,6 @@ class DocumentProcessor:
             if not para:
                 continue
                 
-            # Split large paragraphs
             if len(para.split()) > self.chunk_size * 2:
                 sentences = self._split_into_sentences(para)
                 current_para = ""
@@ -588,8 +671,7 @@ class DocumentProcessor:
                     elif len((current_para + " " + sentence).split()) <= self.chunk_size * 2:
                         current_para += " " + sentence
                     else:
-                        if current_para:
-                            refined_paragraphs.append(current_para)
+                        refined_paragraphs.append(current_para)
                         current_para = sentence
                 
                 if current_para:
@@ -598,9 +680,9 @@ class DocumentProcessor:
                 refined_paragraphs.append(para)
         
         return refined_paragraphs
-
+    
     def _split_into_sentences(self, text: str) -> List[str]:
-        """Split text into sentences."""
+        """Split text into sentences with improved logic."""
         sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z])|(?<=[.!?])\s*\n+\s*(?=[A-Z])'
         sentences = re.split(sentence_pattern, text)
         
@@ -611,9 +693,9 @@ class DocumentProcessor:
                 cleaned_sentences.append(sentence)
         
         return cleaned_sentences
-
+    
     def _create_chunk(self, text: str, document_id: str, chunk_index: int, document_url: str) -> EmbeddingChunk:
-        """Create a chunk with optimized metadata."""
+        """Create a single embedding chunk with metadata."""
         return EmbeddingChunk(
             chunk_id=f"{document_id}_chunk_{chunk_index}",
             document_id=document_id,
@@ -626,21 +708,21 @@ class DocumentProcessor:
                 "document_url": document_url
             }
         )
-
+    
     def _generate_document_id(self, url: str) -> str:
-        """Generate document ID."""
+        """Generate a unique document ID from URL."""
         import hashlib
         return hashlib.md5(url.encode()).hexdigest()[:12]
-
+    
     def _extract_page_number(self, text: str) -> Optional[int]:
         """Extract page number from chunk text."""
         page_match = re.search(r'--- Page (\d+) ---', text)
         if page_match:
             return int(page_match.group(1))
         return None
-
+    
     def _extract_section(self, text: str) -> Optional[str]:
-        """Extract section from text."""
+        """Extract section information from chunk text with enhanced logic."""
         lines = text.split('\n')
         
         for line in lines[:5]:
@@ -652,6 +734,9 @@ class DocumentProcessor:
                 r'^(SECTION|Section)\s+[IVX\d]+[\.\:\-\s]*(.+)',
                 r'^(ARTICLE|Article)\s+[IVX\d]+[\.\:\-\s]*(.+)',
                 r'^(CLAUSE|Clause)\s+[IVX\d]+[\.\:\-\s]*(.+)',
+                r'^(CHAPTER|Chapter)\s+[IVX\d]+[\.\:\-\s]*(.+)',
+                r'^([IVX\d]+[\.\)]\s*.{5,50})',
+                r'^([A-Z][A-Z\s]{10,50}):',
             ]
             
             for pattern in section_patterns:
@@ -659,46 +744,50 @@ class DocumentProcessor:
                 if match:
                     return match.group(0).strip()
         
+        insurance_sections = [
+            'coverage', 'benefits', 'exclusions', 'limitations', 'definitions',
+            'waiting period', 'grace period', 'claims', 'premium', 'renewal',
+            'policy terms', 'conditions', 'procedures', 'eligibility'
+        ]
+        
+        text_lower = text.lower()
+        for section in insurance_sections:
+            if section in text_lower:
+                for line in lines[:3]:
+                    if section in line.lower():
+                        return line.strip()
+                        
         return None
-
+    
     def _classify_clause_type(self, text: str) -> Optional[str]:
-        """Classify clause type."""
+        """Classify the type of clause based on content with enhanced patterns."""
         text_lower = text.lower()
         
         classification_patterns = {
-            'coverage_clause': ['cover', 'benefit', 'include', 'eligible'],
-            'exclusion_clause': ['exclude', 'not cover', 'limitation', 'restrict'],
-            'condition_clause': ['condition', 'require', 'must', 'shall'],
-            'payment_clause': ['premium', 'payment', 'cost', 'fee'],
-            'claims_clause': ['claim', 'settlement', 'procedure', 'process'],
+            'coverage_clause': ['cover', 'benefit', 'include', 'eligible', 'entitle', 'reimburse', 'payable', 'treatment covered', 'medical expenses', 'hospital benefit'],
+            'exclusion_clause': ['exclude', 'not cover', 'limitation', 'restrict', 'prohibit', 'except', 'does not include', 'not eligible', 'not payable'],
+            'condition_clause': ['condition', 'require', 'must', 'shall', 'obligation', 'duty', 'responsibility', 'comply', 'fulfill', 'subject to'],
+            'payment_clause': ['premium', 'payment', 'cost', 'fee', 'charge', 'amount', 'installment', 'due', 'payable', 'billing'],
+            'time_clause': ['waiting period', 'grace period', 'time', 'duration', 'deadline', 'within', 'before', 'after', 'days', 'months', 'years'],
+            'claims_clause': ['claim', 'settlement', 'procedure', 'process', 'submit', 'documentation', 'proof', 'evidence', 'notification'],
+            'definitions_clause': ['means', 'defined as', 'definition', 'interpret', 'refer to', 'shall mean', 'is defined', 'for the purpose'],
+            'renewal_clause': ['renewal', 'renew', 'extend', 'continuation', 'expiry', 'terminate', 'cancellation', 'policy period']
         }
         
+        category_scores = {}
         for category, keywords in classification_patterns.items():
-            if any(keyword in text_lower for keyword in keywords):
-                return category
+            score = 0
+            for keyword in keywords:
+                if keyword in text_lower:
+                    score += len(keyword.split())
+            category_scores[category] = score
+        
+        if category_scores:
+            best_category = max(category_scores, key=category_scores.get)
+            if category_scores[best_category] > 0:
+                return best_category
         
         return 'general_clause'
 
-    # Keep the legacy method for backward compatibility
-    async def process_document(self, url: str) -> tuple[DocumentMetadata, List[EmbeddingChunk]]:
-        """Legacy method that collects all chunks - use streaming version for memory efficiency."""
-        logger.warning("Using legacy process_document - consider using streaming version")
-        
-        metadata, chunk_generator = await self.process_document_streaming(url)
-        
-        all_chunks = []
-        async for chunk_batch in self._async_chunk_generator(chunk_generator):
-            all_chunks.extend(chunk_batch)
-            
-            # Check memory periodically
-            if not self._check_memory_usage():
-                await asyncio.sleep(0.1)
-        
-        metadata.total_chunks = len(all_chunks)
-        return metadata, all_chunks
-
-    async def _async_chunk_generator(self, sync_generator):
-        """Convert sync generator to async for compatibility."""
-        for batch in sync_generator:
-            yield batch
-            await asyncio.sleep(0)  # Allow event loop to process
+# Create aliases for compatibility
+DocumentProcessor = OptimizedDocumentProcessor

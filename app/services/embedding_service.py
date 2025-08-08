@@ -47,6 +47,34 @@ class EmbeddingService:
         except Exception as e:
             logger.error("Failed to initialize clients", error=str(e))
     
+    def _estimate_tokens(self, text: str) -> int:
+        """Quick token estimation - 4 characters ≈ 1 token"""
+        return len(text) // 4
+    
+    def _split_batch_by_tokens(self, texts: List[str], max_tokens: int = 250000) -> List[List[str]]:
+        """Split texts into batches that stay under token limit"""
+        batches = []
+        current_batch = []
+        current_tokens = 0
+        
+        for text in texts:
+            text_tokens = self._estimate_tokens(text)
+            
+            # If adding this text would exceed limit, start new batch
+            if current_tokens + text_tokens > max_tokens and current_batch:
+                batches.append(current_batch)
+                current_batch = [text]
+                current_tokens = text_tokens
+            else:
+                current_batch.append(text)
+                current_tokens += text_tokens
+        
+        # Add the last batch if it has content
+        if current_batch:
+            batches.append(current_batch)
+            
+        return batches
+
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings for a list of texts, with caching."""
         if not self.openai_client:
@@ -66,23 +94,32 @@ class EmbeddingService:
                     safe_text = self._truncate_text_to_token_limit(text, token_limit)
                     texts_to_embed.append(safe_text)
             logger.info("Embedding cache check", hits=len(embeddings_map), misses=len(texts_to_embed))
-            # If there are any texts that were not in the cache, embed them in a batch
+            # If there are any texts that were not in the cache, embed them with smart batching
             if texts_to_embed:
-                # ⚡ ULTRA-FAST: Remove rate limiting delays, rely on OpenAI's built-in handling
+                # ⚡ SMART BATCHING: Split by token count to avoid API limits
                 try:
-                    logger.info("Generating embeddings at max speed", count=len(texts_to_embed))
-                    response = await self.openai_client.embeddings.create(
-                        model=settings.openai_embedding_model,
-                        input=texts_to_embed
-                    )
-                    new_embeddings = [embedding.embedding for embedding in response.data]
+                    logger.info("Generating embeddings with smart batching", count=len(texts_to_embed))
+                    
+                    # Split into token-safe batches
+                    token_batches = self._split_batch_by_tokens(texts_to_embed, max_tokens=250000)
+                    logger.info(f"Split into {len(token_batches)} token-safe batches")
+                    
+                    new_embeddings = []
+                    for batch_idx, batch in enumerate(token_batches):
+                        logger.info(f"Processing embedding batch {batch_idx + 1}/{len(token_batches)}, size: {len(batch)}")
+                        response = await self.openai_client.embeddings.create(
+                            model=settings.openai_embedding_model,
+                            input=batch
+                        )
+                        batch_embeddings = [embedding.embedding for embedding in response.data]
+                        new_embeddings.extend(batch_embeddings)
                     
                     # Add new embeddings to the map and set them in the cache
                     for orig_text, embedding in zip(texts_to_embed, new_embeddings):
                         embeddings_map[orig_text] = embedding
                         await self.cache_service.set_embedding_cache(orig_text, embedding)
                     
-                    logger.info("Generated embeddings at max speed", count=len(texts_to_embed))
+                    logger.info("Generated embeddings with smart batching", count=len(texts_to_embed))
                     
                 except Exception as api_error:
                     error_str = str(api_error).lower()
@@ -90,11 +127,20 @@ class EmbeddingService:
                         logger.warning("Rate limit hit, using exponential backoff")
                         # Only retry on rate limits with minimal delay
                         await asyncio.sleep(2.0)  # 2 second delay only
-                        response = await self.openai_client.embeddings.create(
-                            model=settings.openai_embedding_model,
-                            input=texts_to_embed
-                        )
-                        new_embeddings = [embedding.embedding for embedding in response.data]
+                        
+                        # Split into even smaller batches on retry
+                        token_batches = self._split_batch_by_tokens(texts_to_embed, max_tokens=150000)
+                        logger.info(f"Retry with {len(token_batches)} smaller batches")
+                        
+                        new_embeddings = []
+                        for batch in token_batches:
+                            response = await self.openai_client.embeddings.create(
+                                model=settings.openai_embedding_model,
+                                input=batch
+                            )
+                            batch_embeddings = [embedding.embedding for embedding in response.data]
+                            new_embeddings.extend(batch_embeddings)
+                            
                         for orig_text, embedding in zip(texts_to_embed, new_embeddings):
                             embeddings_map[orig_text] = embedding
                             await self.cache_service.set_embedding_cache(orig_text, embedding)

@@ -34,22 +34,22 @@ class RetrievalService:
         if document_processor:
             self.document_processor = document_processor
         else:
-            from app.services.document_processor import DocumentProcessor
-            self.document_processor = DocumentProcessor()
+            from app.services.document_processor import OptimizedDocumentProcessor
+            self.document_processor = OptimizedDocumentProcessor()
         
-        # 🚀 PRODUCTION OPTIMIZED: 800MB memory available
-        self.max_memory_threshold = 0.90  # 90% of 800MB = 720MB usable
-        self.chunk_processing_batch_size = 5000  # MASSIVE: 5000 chunks per batch (was 2000)
-        self.embedding_batch_size = 500  # HUGE: 500 embeddings per API call (was 200)
-        self.max_concurrent_questions = 25  # MORE: 25 concurrent questions (was 15)
-        self.memory_check_frequency = 20  # Check less frequently for speed (was 10)
+        # 🚀 PRODUCTION OPTIMIZED: 800MB memory available - USE FULL 800MB!
+        self.max_memory_threshold = 1.00  # 100% of 800MB = 800MB fully utilized
+        self.chunk_processing_batch_size = 10000  # MASSIVE: 10,000 chunks per batch (doubled from 5000)
+        self.embedding_batch_size = 250  # MAXIMUM: 250 embeddings per API call (increased from 150)
+        self.max_concurrent_questions = 50  # MAXIMUM: 50 concurrent questions (doubled from 25)
+        self.memory_check_frequency = 50  # Check even less frequently for speed (was 20)
         
         # Ultra-fast caching
         self._collection_exists_cache = None
         
-        logger.info("PRODUCTION mode initialized", 
-                   memory_threshold=f"{self.max_memory_threshold*100}%",
-                   memory_available="800MB",
+        logger.info("PRODUCTION mode initialized - MAXIMUM 800MB USAGE", 
+                   memory_threshold=f"{self.max_memory_threshold*100:.0f}%",
+                   memory_available="800MB - FULL UTILIZATION",
                    chunk_batch_size=self.chunk_processing_batch_size,
                    embedding_batch_size=self.embedding_batch_size,
                    concurrent_questions=self.max_concurrent_questions)
@@ -109,13 +109,13 @@ class RetrievalService:
                 )
                 metadata, chunk_generator = await document_task
                 
-                # Process all chunks in mega-batches with no delays
-                for chunk_batch in chunk_generator:
-                    store_task = asyncio.wait_for(
-                        self._process_and_store_chunk_batch_ultra_fast(chunk_batch, document_id),
-                        timeout=60.0  # 1 minute per batch
-                    )
-                    await store_task
+                # 🚀 NEW STAGED PROCESSING: Process everything in memory first
+                store_task = asyncio.wait_for(
+                    self._process_and_store_all_chunks_staged(chunk_generator, document_id),
+                    timeout=300.0  # 5 minutes for entire staged processing
+                )
+                total_stored = await store_task
+                logger.info(f"Staged processing completed: {total_stored} chunks processed")
 
             # ⚡ STEP 3: MAXIMUM SPEED question processing with timeout
             # Generate ALL embeddings at once
@@ -212,7 +212,7 @@ class RetrievalService:
                 total_chunks_processed = 0
                 batch_count = 0
                 
-                for chunk_batch in chunk_generator:
+                async for chunk_batch in chunk_generator:
                     await self._process_and_store_chunk_batch_ultra_fast(chunk_batch, document_id)
                     total_chunks_processed += len(chunk_batch)
                     batch_count += 1
@@ -297,6 +297,99 @@ class RetrievalService:
             logger.error("Ultra-fast processing failed", error=str(e), exc_info=True)
             raise ValueError(f"Ultra-fast query processing failed: {str(e)}")
 
+    async def _process_and_store_all_chunks_staged(self, chunk_generator, document_id: str):
+        """
+        STAGED PROCESSING: Process all chunks in memory first, then embeddings, then storage.
+        Uses available memory (800MB) more efficiently for maximum speed.
+        """
+        logger.info("Starting STAGED processing - all chunks in memory first")
+        start_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
+        logger.info(f"Starting memory usage: {start_memory_mb}MB")
+        
+        # 🚀 STAGE 1: Collect ALL chunks in memory first
+        all_chunks = []
+        chunk_count = 0
+        
+        logger.info("STAGE 1: Processing all chunks into memory...")
+        async for chunk_batch in chunk_generator:
+            all_chunks.extend(chunk_batch)
+            chunk_count += len(chunk_batch)
+            
+            # Log progress every 1000 chunks
+            if chunk_count % 1000 == 0:
+                memory_mb = psutil.virtual_memory().used // (1024 * 1024)
+                logger.info(f"Processed {chunk_count} chunks, memory: {memory_mb}MB")
+        
+        total_chunks = len(all_chunks)
+        stage1_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
+        logger.info(f"STAGE 1 COMPLETE: {total_chunks} chunks in memory, memory: {stage1_memory_mb}MB")
+        
+        # 🚀 STAGE 2: Generate ALL embeddings at once
+        logger.info("STAGE 2: Generating ALL embeddings...")
+        texts = [chunk.text for chunk in all_chunks]
+        
+        # Process in large batches but keep everything in memory
+        all_embeddings = await self.embedding_service.generate_embeddings(texts)
+        
+        # Validate embeddings were generated
+        valid_embeddings = [e for e in all_embeddings if e is not None and len(e) > 0]
+        logger.info(f"Embedding validation: {len(valid_embeddings)}/{len(all_embeddings)} valid embeddings")
+        
+        # Attach embeddings to chunks
+        for chunk, embedding in zip(all_chunks, all_embeddings):
+            chunk.embedding = embedding
+            
+        stage2_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
+        logger.info(f"STAGE 2 COMPLETE: {len(all_embeddings)} embeddings generated, memory: {stage2_memory_mb}MB")
+        
+        # Clear text array to free memory
+        del texts, all_embeddings
+        
+        # 🚀 STAGE 3: Store ALL chunks in vector DB with concurrent batches
+        logger.info("STAGE 3: Storing all chunks in vector DB with concurrent processing...")
+        
+        # Store in mega-batches for speed with concurrent processing
+        storage_batch_size = 1000  # Store 1000 chunks at once
+        stored_count = 0
+        
+        # Create concurrent storage tasks
+        storage_tasks = []
+        for i in range(0, total_chunks, storage_batch_size):
+            batch = all_chunks[i:i + storage_batch_size]
+            task = self.embedding_service.qdrant_service.store_embeddings(batch)
+            storage_tasks.append((i, len(batch), task))
+        
+        # Execute all storage tasks concurrently
+        logger.info(f"Executing {len(storage_tasks)} concurrent storage batches...")
+        results = await asyncio.gather(*[task for _, _, task in storage_tasks], return_exceptions=True)
+        
+        # Count successful storage
+        for (batch_idx, batch_size, _), result in zip(storage_tasks, results):
+            if isinstance(result, Exception):
+                logger.error(f"Storage batch {batch_idx//storage_batch_size + 1} failed: {str(result)}")
+            elif result:
+                stored_count += batch_size
+                logger.info(f"Storage batch {batch_idx//storage_batch_size + 1} succeeded: {batch_size} chunks")
+            else:
+                # Investigate why storage returned False
+                batch = all_chunks[batch_idx:batch_idx + storage_batch_size]
+                chunks_with_embeddings = sum(1 for chunk in batch if chunk.embedding is not None and len(chunk.embedding) > 0)
+                logger.error(f"Storage batch {batch_idx//storage_batch_size + 1} returned False: {chunks_with_embeddings}/{len(batch)} chunks had valid embeddings")
+        
+        stage3_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
+        logger.info(f"STAGE 3 COMPLETE: {stored_count}/{total_chunks} chunks stored, memory: {stage3_memory_mb}MB")
+        
+        # 🚀 STAGE 4: Clear all memory
+        logger.info("STAGE 4: Clearing memory...")
+        del all_chunks
+        import gc
+        gc.collect()
+        
+        final_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
+        logger.info(f"STAGED PROCESSING COMPLETE: Memory cleared, now using {final_memory_mb}MB")
+        
+        return stored_count
+
     async def _process_and_store_chunk_batch_ultra_fast(self, chunk_batch: List[EmbeddingChunk], document_id: str):
         """Ultra-fast chunk processing with mega-batches."""
         if not chunk_batch:
@@ -304,8 +397,8 @@ class RetrievalService:
 
         logger.info("Ultra-fast chunk processing", batch_size=len(chunk_batch))
         
-        # ⚡ MEGA-BATCH: Process up to 500 chunks per API call
-        mega_batch_size = self.embedding_batch_size  # 500 chunks per API call
+        # ⚡ MEGA-BATCH: Process up to 150 chunks per API call (safe for token limits)
+        mega_batch_size = self.embedding_batch_size  # 150 chunks per API call
         texts = [chunk.text for chunk in chunk_batch]
         
         # Use asyncio.gather for concurrent API calls

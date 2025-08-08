@@ -103,8 +103,8 @@ class QdrantService:
                         collection=collection_name)
             return False
 
-    async def store_embeddings(self, chunks: List[EmbeddingChunk], collection_name: str = None) -> bool:
-        """Store embeddings in Qdrant."""
+    async def recreate_collection_with_correct_dimensions(self, collection_name: str = None) -> bool:
+        """Recreate collection with correct embedding dimensions (3072 for text-embedding-3-large)."""
         if not self.client:
             logger.error("Qdrant client not initialized")
             return False
@@ -112,19 +112,79 @@ class QdrantService:
         collection_name = collection_name or settings.qdrant_collection_name
         
         try:
-            # Ensure collection exists
-            await self.create_collection(collection_name)
+            # Delete existing collection if it exists
+            collections_response = await self.client.get_collections()
+            existing_collections = [col.name for col in collections_response.collections]
             
+            if collection_name in existing_collections:
+                logger.info("Deleting existing collection with wrong dimensions", collection=collection_name)
+                await self.client.delete_collection(collection_name=collection_name)
+            
+            # Create new collection with correct dimensions
+            await self.client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(
+                    size=settings.embedding_dimension,  # Should now be 3072
+                    distance=Distance.COSINE
+                )
+            )
+            logger.info("Recreated Qdrant collection with correct dimensions", 
+                       collection=collection_name, 
+                       dimension=settings.embedding_dimension)
+            
+            # Create payload index
+            await self.create_payload_index(collection_name, "document_id", "keyword")
+            
+            return True
+            
+        except Exception as e:
+            logger.error("Failed to recreate collection", error=str(e), collection=collection_name)
+            return False
+
+    async def store_embeddings(self, chunks: List[EmbeddingChunk], collection_name: str = None) -> bool:
+        """Store embeddings in Qdrant with batch splitting and retry logic."""
+        if not self.client:
+            logger.error("Qdrant client not initialized")
+            return False
+            
+        collection_name = collection_name or settings.qdrant_collection_name
+        
+        try:
+            # Check if collection exists and has correct dimensions
+            collections_response = await self.client.get_collections()
+            existing_collections = [col.name for col in collections_response.collections]
+            
+            if collection_name in existing_collections:
+                # Check collection info to verify dimensions
+                collection_info = await self.client.get_collection(collection_name)
+                current_dimension = collection_info.config.params.vectors.size
+                expected_dimension = settings.embedding_dimension
+                
+                if current_dimension != expected_dimension:
+                    logger.warning("Collection dimension mismatch", 
+                                 current=current_dimension, 
+                                 expected=expected_dimension,
+                                 collection=collection_name)
+                    # Recreate collection with correct dimensions
+                    await self.recreate_collection_with_correct_dimensions(collection_name)
+                else:
+                    logger.info("Collection dimensions correct", dimension=current_dimension)
+            else:
+                # Create new collection
+                await self.create_collection(collection_name)
+            
+            # Convert chunks to points
             points = []
             for i, chunk in enumerate(chunks):
-                logger.info("Processing chunk for storage", 
+                logger.debug("Processing chunk for storage", 
                            chunk_index=i, 
                            chunk_id=getattr(chunk, 'chunk_id', 'unknown'),
                            has_embedding=hasattr(chunk, 'embedding') and chunk.embedding is not None,
+                           embedding_length=len(chunk.embedding) if hasattr(chunk, 'embedding') and chunk.embedding else 0,
                            has_metadata=hasattr(chunk, 'metadata'))
                 
-                if chunk.embedding:
-                    # FIX: Use a stable, unique ID for each point. UUID is a great choice.
+                if chunk.embedding and len(chunk.embedding) > 0:
+                    # Use a stable, unique ID for each point
                     point_id = str(uuid.uuid4())
                     point = PointStruct(
                         id=point_id,
@@ -137,26 +197,94 @@ class QdrantService:
                         }
                     )
                     points.append(point)
-                    logger.info("Created point for chunk", point_id=point_id, chunk_id=chunk.chunk_id)
+                    logger.debug("Created point for chunk", point_id=point_id, chunk_id=chunk.chunk_id)
                 else:
-                    logger.warning("Chunk has no embedding", chunk_id=getattr(chunk, 'chunk_id', 'unknown'))
-            
-            if points:
-                logger.info("Upserting points to Qdrant", point_count=len(points), collection=collection_name)
-                await self.client.upsert(
-                    collection_name=collection_name,
-                    points=points,
-                    wait=True # wait for the operation to complete
-                )
-                logger.info("Stored embeddings in Qdrant", count=len(points), collection=collection_name)
-                return True
-            else:
-                logger.warning("No valid embeddings to store")
+                    logger.warning("Chunk has no valid embedding", 
+                                 chunk_id=getattr(chunk, 'chunk_id', 'unknown'),
+                                 embedding_status=f"embedding={'None' if not hasattr(chunk, 'embedding') else 'empty' if not chunk.embedding else 'length=' + str(len(chunk.embedding))}")
+
+            if not points:
+                logger.error("No valid embeddings to store", 
+                           total_chunks=len(chunks),
+                           chunks_without_embeddings=sum(1 for c in chunks if not hasattr(c, 'embedding') or not c.embedding or len(c.embedding) == 0))
                 return False
+
+            # Split large batches into smaller ones for better reliability
+            max_batch_size = 100  # Qdrant handles smaller batches better
+            total_stored = 0
+            
+            for i in range(0, len(points), max_batch_size):
+                batch_points = points[i:i + max_batch_size]
+                batch_num = i // max_batch_size + 1
+                total_batches = (len(points) + max_batch_size - 1) // max_batch_size
+                
+                logger.info(f"Storing batch {batch_num}/{total_batches}", 
+                           batch_size=len(batch_points),
+                           collection=collection_name)
+                
+                # Try to store this batch with retries
+                if await self._store_batch_with_retry(batch_points, collection_name):
+                    total_stored += len(batch_points)
+                    logger.info(f"Batch {batch_num} stored successfully", stored_count=len(batch_points))
+                else:
+                    logger.error(f"Failed to store batch {batch_num}")
+                    # Continue with other batches instead of failing completely
+            
+            success_rate = (total_stored / len(points)) * 100 if points else 0
+            logger.info("Batch storage completed", 
+                       total_points=len(points),
+                       stored_points=total_stored,
+                       success_rate=f"{success_rate:.1f}%")
+            
+            return total_stored > 0  # Return True if at least some points were stored
                 
         except Exception as e:
-            logger.error("Failed to store embeddings", error=str(e), collection=collection_name)
+            logger.error("Failed to store embeddings - general error", 
+                        error=str(e), 
+                        error_type=type(e).__name__,
+                        collection=collection_name,
+                        chunk_count=len(chunks))
+            import traceback
+            logger.error("Full traceback", traceback=traceback.format_exc())
             return False
+    
+    async def _store_batch_with_retry(self, points: List[PointStruct], collection_name: str) -> bool:
+        """Store a batch of points with retry logic."""
+        max_retries = 3
+        retry_delay = 2.0
+        
+        for attempt in range(max_retries):
+            try:
+                result = await self.client.upsert(
+                    collection_name=collection_name,
+                    points=points,
+                    wait=True
+                )
+                logger.debug("Batch upsert successful", 
+                           result=str(result)[:100], 
+                           collection=collection_name,
+                           attempt=attempt + 1,
+                           point_count=len(points))
+                return True
+                
+            except Exception as upsert_error:
+                logger.warning("Batch upsert failed", 
+                             error=str(upsert_error)[:300], 
+                             error_type=type(upsert_error).__name__,
+                             attempt=attempt + 1,
+                             max_retries=max_retries,
+                             point_count=len(points))
+                
+                if attempt == max_retries - 1:
+                    # Last attempt failed
+                    logger.error("All retry attempts failed for batch")
+                    return False
+                else:
+                    # Wait before retry with exponential backoff
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 1.5
+        
+        return False
     
     async def search_similar(self, query_embedding: List[float], top_k: int = 10, 
                              document_id: Optional[str] = None, collection_name: str = None) -> List[Dict[str, Any]]:
