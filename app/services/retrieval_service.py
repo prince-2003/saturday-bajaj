@@ -69,6 +69,105 @@ class RetrievalService:
         except Exception:
             return True
 
+    async def process_query_ultra_fast(self, request: QueryRequest) -> QueryResponse:
+        """
+        ULTRA-FAST processing specifically designed to prevent client timeouts.
+        
+        Optimizations:
+        - Skip all unnecessary checks and delays
+        - Maximum parallel processing
+        - Minimal logging
+        - Fast-fail on errors
+        """
+        document_url = str(request.documents)
+        document_id = hashlib.md5(document_url.encode()).hexdigest()[:12]
+
+        try:
+            # ⚡ STEP 1: Lightning-fast document check
+            collection_exists = await asyncio.wait_for(
+                self.embedding_service.qdrant_service.collection_exists(),
+                timeout=10.0
+            )
+            if not collection_exists:
+                await asyncio.wait_for(
+                    self.embedding_service.qdrant_service.create_collection(),
+                    timeout=30.0
+                )
+
+            is_processed = await asyncio.wait_for(
+                self.embedding_service.qdrant_service.document_exists(document_id=document_id),
+                timeout=10.0
+            )
+            
+            if not is_processed:
+                # ⚡ STEP 2: ULTRA-FAST document processing with timeout
+                document_task = asyncio.wait_for(
+                    self.document_processor.process_document_streaming(document_url),
+                    timeout=180.0  # 3 minutes max for document processing
+                )
+                metadata, chunk_generator = await document_task
+                
+                # Process all chunks in mega-batches with no delays
+                for chunk_batch in chunk_generator:
+                    store_task = asyncio.wait_for(
+                        self._process_and_store_chunk_batch_ultra_fast(chunk_batch, document_id),
+                        timeout=60.0  # 1 minute per batch
+                    )
+                    await store_task
+
+            # ⚡ STEP 3: MAXIMUM SPEED question processing with timeout
+            # Generate ALL embeddings at once
+            embedding_task = asyncio.wait_for(
+                self.embedding_service.generate_embeddings(list(request.questions)),
+                timeout=60.0  # 1 minute for all embeddings
+            )
+            question_embeddings = await embedding_task
+            
+            # Execute ALL searches in parallel with timeout
+            search_tasks = []
+            for i, (question, embedding) in enumerate(zip(request.questions, question_embeddings)):
+                search_task = asyncio.wait_for(
+                    self.embedding_service.qdrant_service.search_similar(
+                        query_embedding=embedding, 
+                        top_k=7, 
+                        document_id=document_id
+                    ),
+                    timeout=10.0  # 10 seconds per search
+                )
+                search_tasks.append((i, question, search_task))
+            
+            # Get all search results
+            search_results = await asyncio.gather(*[task for _, _, task in search_tasks], return_exceptions=True)
+            
+            # Execute ALL LLM calls in parallel with timeout
+            questions_data = []
+            for (i, question, _), search_result in zip(search_tasks, search_results):
+                if isinstance(search_result, Exception):
+                    search_result = []
+                questions_data.append({
+                    "question": question,
+                    "context_chunks": search_result,
+                    "index": i
+                })
+            
+            # Process all questions simultaneously with timeout
+            llm_task = asyncio.wait_for(
+                self.llm_service.answer_multiple_questions_batch(questions_data, document_id),
+                timeout=120.0  # 2 minutes for all LLM calls
+            )
+            results = await llm_task
+            
+            # Extract answers
+            all_answers = [result["answer"] for result in results]
+            
+            return QueryResponse(answers=all_answers)
+            
+        except Exception as e:
+            logger.error("Ultra-fast processing failed", error=str(e))
+            # Fast-fail with minimal error response
+            error_answers = [f"Processing error: {str(e)}" for _ in request.questions]
+            return QueryResponse(answers=error_answers)
+
     async def process_query_streaming(self, request: QueryRequest) -> QueryResponse:
         """Ultra-fast query processing under 60 seconds."""
         start_time = time.time()

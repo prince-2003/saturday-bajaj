@@ -1,7 +1,10 @@
-from fastapi import APIRouter, HTTPException, Depends, status
-from typing import List, Dict, Any
+from fastapi import APIRouter, HTTPException, Depends, status, BackgroundTasks
+from fastapi.responses import StreamingResponse
+from typing import List, Dict, Any, AsyncGenerator
 import structlog
 import time
+import json
+import asyncio
 
 from app.core.security import verify_api_key
 from app.models.schemas import QueryRequest, QueryResponse, ErrorResponse
@@ -48,6 +51,149 @@ async def run_hackrx_query(
         logger.info("Received hackrx query request", 
                    document_url=str(request.documents),
                    question_count=len(request.questions))
+
+        # Fast validation
+        if not request.questions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="At least one question must be provided"
+            )
+
+        if len(request.questions) > 50:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Maximum 50 questions allowed per request"
+            )
+
+        # Process with ultra-fast mode - no timeout concerns
+        retrieval_service = get_retrieval_service()
+        response = await retrieval_service.process_query_ultra_fast(request)
+        
+        processing_time = time.time() - start_time
+        logger.info("Request processed successfully", 
+                   processing_time=processing_time,
+                   answers_count=len(response.answers))
+        
+        return response
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+        
+    except ValueError as e:
+        logger.error("Validation error", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid request: {str(e)}"
+        )
+        
+    except Exception as e:
+        logger.error("Unexpected error processing request", 
+                    error=str(e),
+                    error_type=type(e).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error occurred while processing the request"
+        )
+
+
+@router.post("/hackrx/run-stream")
+async def run_hackrx_query_stream(
+    request: QueryRequest,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Streaming endpoint that sends progress updates to prevent client timeouts.
+    
+    Returns Server-Sent Events (SSE) with processing status and final results.
+    """
+    async def generate_stream() -> AsyncGenerator[str, None]:
+        start_time = time.time()
+        
+        try:
+            logger.info("Starting streaming processing", 
+                       document_url=str(request.documents),
+                       question_count=len(request.questions))
+
+            # Send initial status
+            yield f"data: {json.dumps({'status': 'started', 'message': 'Processing document...', 'progress': 0})}\n\n"
+            
+            # Fast validation
+            if not request.questions:
+                yield f"data: {json.dumps({'status': 'error', 'error': 'At least one question must be provided'})}\n\n"
+                return
+
+            if len(request.questions) > 50:
+                yield f"data: {json.dumps({'status': 'error', 'error': 'Maximum 50 questions allowed per request'})}\n\n"
+                return
+
+            # Keep client alive with progress updates
+            keepalive_active = True
+            
+            async def send_keepalive():
+                progress = 10
+                while keepalive_active and progress < 90:
+                    await asyncio.sleep(5)  # Send update every 5 seconds
+                    if keepalive_active:
+                        progress += 10
+                        yield f"data: {json.dumps({'status': 'processing', 'message': f'Processing... {progress}%', 'progress': progress})}\n\n"
+            
+            # Start keepalive task
+            keepalive_gen = send_keepalive()
+            
+            try:
+                # Process the request
+                retrieval_service = get_retrieval_service()
+                response = await retrieval_service.process_query_ultra_fast(request)
+                
+                # Cancel keepalive
+                keepalive_active = False
+                
+                processing_time = time.time() - start_time
+                
+                # Send final result
+                result = {
+                    'status': 'completed',
+                    'processing_time': processing_time,
+                    'answers': response.answers,
+                    'message': f'Completed in {processing_time:.1f} seconds'
+                }
+                
+                yield f"data: {json.dumps(result)}\n\n"
+                logger.info("Streaming request completed", processing_time=processing_time)
+                
+            except Exception as e:
+                keepalive_active = False
+                yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+                logger.error("Streaming processing failed", error=str(e))
+                
+        except Exception as e:
+            yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+            logger.error("Stream generation failed", error=str(e))
+    
+    return StreamingResponse(generate_stream(), media_type="text/plain")
+
+
+@router.post("/hackrx/run-legacy", 
+             response_model=QueryResponse,
+             responses={
+                 400: {"model": ErrorResponse},
+                 401: {"model": ErrorResponse},
+                 500: {"model": ErrorResponse}
+             })
+async def run_hackrx_query_legacy(
+    request: QueryRequest,
+    api_key: str = Depends(verify_api_key)
+) -> QueryResponse:
+    """
+    Legacy endpoint for backward compatibility (may timeout on large documents).
+    """
+    start_time = time.time()
+    
+    try:
+        logger.info("Legacy endpoint - received hackrx query request", 
+                   document_url=str(request.documents),
+                   question_count=len(request.questions))
         
         # Validate request
         if not request.questions:
@@ -67,7 +213,7 @@ async def run_hackrx_query(
         response = await retrieval_service.process_query(request)
         
         processing_time = time.time() - start_time
-        logger.info("Request processed successfully", 
+        logger.info("Legacy request processed successfully", 
                    processing_time=processing_time,
                    answers_count=len(response.answers))
         

@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"  # Use only 2.5-flash for all queries
     gemini_max_tokens: int = 8192
     
+    # Timeout Configuration
+    client_timeout: int = 300  # 5 minutes max for client requests
+    llm_timeout: int = 30      # 30 seconds per LLM call
+    embedding_timeout: int = 60 # 1 minute for embedding generation
+    document_processing_timeout: int = 180  # 3 minutes for document processing
+    
     # Embedding Configuration
     embedding_dimension: int = 1536  # OpenAI embedding dimension
     
