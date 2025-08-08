@@ -37,20 +37,22 @@ class RetrievalService:
             from app.services.document_processor import DocumentProcessor
             self.document_processor = DocumentProcessor()
         
-        # ✅ ULTRA-FAST: Push limits for sub-60 second processing
-        self.max_memory_threshold = 0.85  # 85% - push closer to limit
-        self.chunk_processing_batch_size = 2000  # 200 pages worth
-        self.embedding_batch_size = 200  # Mega-batches for fewer API calls
-        self.max_concurrent_questions = 15  # More concurrent processing
-        self.memory_check_frequency = 10  # Check memory less frequently
+        # 🚀 PRODUCTION OPTIMIZED: 800MB memory available
+        self.max_memory_threshold = 0.90  # 90% of 800MB = 720MB usable
+        self.chunk_processing_batch_size = 5000  # MASSIVE: 5000 chunks per batch (was 2000)
+        self.embedding_batch_size = 500  # HUGE: 500 embeddings per API call (was 200)
+        self.max_concurrent_questions = 25  # MORE: 25 concurrent questions (was 15)
+        self.memory_check_frequency = 20  # Check less frequently for speed (was 10)
         
         # Ultra-fast caching
         self._collection_exists_cache = None
         
-        logger.info("Ultra-fast mode initialized", 
+        logger.info("PRODUCTION mode initialized", 
                    memory_threshold=f"{self.max_memory_threshold*100}%",
+                   memory_available="800MB",
                    chunk_batch_size=self.chunk_processing_batch_size,
-                   embedding_batch_size=self.embedding_batch_size)
+                   embedding_batch_size=self.embedding_batch_size,
+                   concurrent_questions=self.max_concurrent_questions)
 
     def _check_memory_and_cleanup(self) -> bool:
         """Ultra-fast memory check with aggressive cleanup."""
@@ -302,8 +304,8 @@ class RetrievalService:
 
         logger.info("Ultra-fast chunk processing", batch_size=len(chunk_batch))
         
-        # ✅ MEGA-BATCH: Process up to 200 chunks per API call
-        mega_batch_size = self.embedding_batch_size  # 200 chunks per API call
+        # ⚡ MEGA-BATCH: Process up to 500 chunks per API call
+        mega_batch_size = self.embedding_batch_size  # 500 chunks per API call
         texts = [chunk.text for chunk in chunk_batch]
         
         # Use asyncio.gather for concurrent API calls

@@ -31,17 +31,18 @@ class DocumentProcessor:
     def __init__(self):
         self.chunk_size = settings.chunk_size
         self.chunk_overlap = settings.chunk_overlap
-        # ✅ ULTRA-FAST: Settings for sub-60 second processing
-        self.max_memory_usage = 0.85  # 85% of 1GB - push limits for speed
-        self.batch_size = 150  # Process 150 pages at a time for optimal performance
-        self.embedding_batch_size = 200  # Mega embedding batches for fewer API calls
-        # Ultra-fast optimization settings
+        # 🚀 PRODUCTION OPTIMIZED: 800MB memory available
+        self.max_memory_usage = 0.90  # 90% of 800MB = 720MB usable
+        self.batch_size = 400  # DOUBLED: 400 pages at once (was 150)
+        self.embedding_batch_size = 500  # MASSIVE: 500 embeddings per API call (was 200)
+        # Ultra-fast optimization settings for production
         self.max_tokens_per_chunk = 1200  # Increased for testing - was 800
         self.min_chunk_size = 50  # Smaller minimum for faster processing
         self.enable_chunk_compression = True  # Keep compression for efficiency
-        logger.info("Ultra-fast DocumentProcessor initialized", 
+        logger.info("PRODUCTION DocumentProcessor initialized", 
                    batch_size=self.batch_size,
-                   memory_limit=f"{self.max_memory_usage*100}%")
+                   memory_limit=f"{self.max_memory_usage*100}%",
+                   memory_available="800MB")
 
     def _check_memory_usage(self) -> bool:
         """Check if memory usage is within limits."""
@@ -59,7 +60,8 @@ class DocumentProcessor:
     async def download_document(self, url: str) -> bytes:
         """Download document with memory-efficient streaming."""
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            # 🚀 PRODUCTION: Increase timeout for larger files (800MB memory = bigger files)
+            async with httpx.AsyncClient(timeout=120.0) as client:  # Doubled from 60s
                 async with client.stream('GET', url) as response:
                     response.raise_for_status()
                     
@@ -187,8 +189,9 @@ class DocumentProcessor:
                        file_size_mb=round(os.path.getsize(file_path) / 1024 / 1024, 1))
             
             # Optimized parameters for maximum speed
-            page_batch_size = min(200, total_pages)  # Larger batches for speed
-            max_workers = min(8, cpu_count())  # More workers for speed
+            # 🚀 PRODUCTION OPTIMIZED: 800MB memory = larger batches & more workers
+            page_batch_size = min(600, total_pages)  # TRIPLE: 600 pages per batch (was 200)
+            max_workers = min(16, cpu_count() * 2)  # DOUBLE: 16 workers (was 8)
             
             chunk_index = 0
             extraction_stats = {"pdfplumber": 0, "pymupdf": 0, "pdfminer": 0, "pypdf2": 0, "failed": 0}
@@ -285,8 +288,9 @@ class DocumentProcessor:
         results = []
         batch_size = end_page - start_page
         
-        # Ultra-fast timeout: 0.8 seconds per page minimum, 2 minutes maximum
-        timeout = min(max(batch_size * 0.8, 45), 120)
+        # 🚀 PRODUCTION: Adjusted for larger batches (600 pages)
+        # 0.5 seconds per page minimum, 5 minutes maximum for huge batches
+        timeout = min(max(batch_size * 0.5, 60), 300)  # Increased max from 120s to 300s
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all page extraction tasks
