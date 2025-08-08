@@ -16,13 +16,18 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4-turbo"
     openai_embedding_model: str = "text-embedding-3-large"
-    max_tokens: int = 1500  # Reduced for faster responses
+    max_tokens: int = 4000  # Increased for testing - was 1500
     temperature: float = 0.1
     
     # Anthropic Configuration (Primary LLM)
     anthropic_api_key: Optional[str] = None
     anthropic_model: str = "claude-3-haiku-20240307"
-    anthropic_max_tokens: int = 1000
+    anthropic_max_tokens: int = 3000  # Increased for testing - was 1000
+    
+    # Google Gemini Configuration (New Primary LLM)
+    google_api_key: Optional[str] = None
+    gemini_model: str = "gemini-2.5-flash"  # Use only 2.5-flash for all queries
+    gemini_max_tokens: int = 8192
     
     # Embedding Configuration
     embedding_dimension: int = 1536  # OpenAI embedding dimension
@@ -71,6 +76,12 @@ class Settings(BaseSettings):
     simple_question_threshold: float = 0.3  # Complexity threshold
     use_fast_model_first: bool = True
     fallback_to_gpt4: bool = True
+    
+    # Rate Limiting Settings
+    openai_requests_per_minute: int = 3000
+    anthropic_requests_per_minute: int = 1000
+    base_retry_delay: float = 1.0
+    max_retries: int = 3
     
     # Memory Management
     max_memory_cache_size: int = 1000  # Number of items

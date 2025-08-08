@@ -31,17 +31,14 @@ class DocumentProcessor:
     def __init__(self):
         self.chunk_size = settings.chunk_size
         self.chunk_overlap = settings.chunk_overlap
-        
         # ✅ ULTRA-FAST: Settings for sub-60 second processing
         self.max_memory_usage = 0.85  # 85% of 1GB - push limits for speed
-        self.batch_size = 200  # Process 200 pages at a time for ultra performance
+        self.batch_size = 150  # Process 150 pages at a time for optimal performance
         self.embedding_batch_size = 200  # Mega embedding batches for fewer API calls
-        
         # Ultra-fast optimization settings
-        self.max_tokens_per_chunk = 800  # Optimal size for speed vs context
+        self.max_tokens_per_chunk = 1200  # Increased for testing - was 800
         self.min_chunk_size = 50  # Smaller minimum for faster processing
         self.enable_chunk_compression = True  # Keep compression for efficiency
-        
         logger.info("Ultra-fast DocumentProcessor initialized", 
                    batch_size=self.batch_size,
                    memory_limit=f"{self.max_memory_usage*100}%")
@@ -189,9 +186,9 @@ class DocumentProcessor:
                        total_pages=total_pages,
                        file_size_mb=round(os.path.getsize(file_path) / 1024 / 1024, 1))
             
-            # Optimized parameters for speed + accuracy balance
-            page_batch_size = min(150, total_pages)  # Balanced batch size
-            max_workers = min(4, cpu_count())
+            # Optimized parameters for maximum speed
+            page_batch_size = min(200, total_pages)  # Larger batches for speed
+            max_workers = min(8, cpu_count())  # More workers for speed
             
             chunk_index = 0
             extraction_stats = {"pdfplumber": 0, "pymupdf": 0, "pdfminer": 0, "pypdf2": 0, "failed": 0}
@@ -199,33 +196,45 @@ class DocumentProcessor:
             for batch_start in range(0, total_pages, page_batch_size):
                 batch_end = min(batch_start + page_batch_size, total_pages)
                 
-                logger.info(f"Processing robust batch {batch_start + 1}-{batch_end}/{total_pages}")
+                logger.info(f"Processing robust batch {batch_start + 1}-{batch_end}/{total_pages} (workers: {max_workers})")
                 
-                # Extract batch with parallel processing and fallback
-                batch_results = self._extract_batch_optimized_robust(
-                    file_path, batch_start, batch_end, max_workers, extraction_stats
-                )
-                
-                if batch_results:
-                    # Convert to chunks
-                    batch_text = "\n".join([
-                        f"--- Page {page_num + 1} ---\n{text}" 
-                        for page_num, text in batch_results 
-                        if text.strip()
-                    ])
+                try:
+                    # Extract batch with parallel processing and fallback
+                    batch_results = self._extract_batch_optimized_robust(
+                        file_path, batch_start, batch_end, max_workers, extraction_stats
+                    )
                     
-                    if batch_text.strip():
-                        chunks = self._create_chunks_from_text(
-                            batch_text, document_id, chunk_index, document_url
-                        )
+                    logger.info(f"Batch extraction completed", 
+                               pages_processed=len(batch_results), 
+                               pages_expected=batch_end - batch_start)
+                    
+                    if batch_results:
+                        # Convert to chunks
+                        batch_text = "\n".join([
+                            f"--- Page {page_num + 1} ---\n{text}" 
+                            for page_num, text in batch_results 
+                            if text.strip()
+                        ])
                         
-                        if chunks:
-                            chunk_index += len(chunks)
-                            yield chunks
-                            logger.info(f"Generated {len(chunks)} chunks from batch")
+                        if batch_text.strip():
+                            chunks = self._create_chunks_from_text(
+                                batch_text, document_id, chunk_index, document_url
+                            )
+                            
+                            if chunks:
+                                chunk_index += len(chunks)
+                                yield chunks
+                                logger.info(f"Generated {len(chunks)} chunks from batch {batch_start + 1}-{batch_end}")
+                    else:
+                        logger.warning(f"No content extracted from batch {batch_start + 1}-{batch_end}")
+                        
+                except Exception as batch_error:
+                    logger.error(f"Batch {batch_start + 1}-{batch_end} processing failed", error=str(batch_error))
+                    # Continue with next batch instead of stopping
+                    continue
                 
-                # Brief pause for system balance
-                time.sleep(0.1)
+                # Brief pause for system balance and file handle cleanup (reduced for speed)
+                time.sleep(0.05)  # Reduced from 0.2s to 0.05s
             
             # Log extraction statistics
             total_attempted = sum(extraction_stats.values())
@@ -233,12 +242,25 @@ class DocumentProcessor:
                 success_rate = ((total_attempted - extraction_stats["failed"]) / total_attempted) * 100
                 logger.info("PDF extraction statistics", 
                            success_rate=f"{success_rate:.1f}%",
-                           methods=extraction_stats)
+                           methods=extraction_stats,
+                           total_pages=total_pages)
+                
+                # If success rate is very low, warn but continue
+                if success_rate < 30:
+                    logger.warning("Low extraction success rate", success_rate=f"{success_rate:.1f}%")
+            else:
+                logger.warning("No pages were processed successfully")
                 
         except Exception as e:
-            logger.error("Robust PDF processing failed", error=str(e))
-            return
-            yield []
+            logger.error("Robust PDF processing failed completely", error=str(e))
+            # Don't return empty - let the system try fallback processing
+            logger.info("Attempting fallback to basic PDF processing...")
+            try:
+                # Fallback to basic pdfplumber processing
+                yield from self._process_pdf_streaming(file_path, document_id, document_url)
+            except Exception as fallback_error:
+                logger.error("Fallback processing also failed", error=str(fallback_error))
+                return
 
     def _get_pdf_page_count_safe(self, file_path: str) -> int:
         """Get PDF page count using fastest reliable method."""
@@ -261,6 +283,10 @@ class DocumentProcessor:
                                       max_workers: int, stats: Dict[str, int]) -> List[Tuple[int, str]]:
         """Extract pages with optimized robust multi-library approach."""
         results = []
+        batch_size = end_page - start_page
+        
+        # Ultra-fast timeout: 0.8 seconds per page minimum, 2 minutes maximum
+        timeout = min(max(batch_size * 0.8, 45), 120)
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all page extraction tasks
@@ -269,74 +295,55 @@ class DocumentProcessor:
                 for page_num in range(start_page, end_page)
             }
             
-            # Collect results as they complete
-            for future in as_completed(future_to_page, timeout=60):
-                page_num = future_to_page[future]
-                try:
-                    text = future.result()
-                    if text and text.strip():
-                        results.append((page_num, text))
-                except Exception as e:
-                    logger.warning(f"Page {page_num + 1} robust extraction failed", error=str(e))
-                    stats["failed"] += 1
+            # Collect results as they complete with optimized timeout
+            completed_futures = []
+            try:
+                # Use timeout for as_completed to avoid hanging on slow pages
+                for future in as_completed(future_to_page, timeout=timeout):
+                    completed_futures.append(future)
+                    page_num = future_to_page[future]
+                    try:
+                        text = future.result(timeout=2)  # Very short individual timeout
+                        if text and text.strip():
+                            results.append((page_num, text))
+                    except Exception as e:
+                        logger.debug(f"Page {page_num + 1} extraction failed/skipped", error=str(e))
+                        stats["failed"] += 1
+                        # Continue processing other pages
+            except Exception as e:
+                logger.warning(f"Batch timeout reached, processed {len(completed_futures)}/{len(future_to_page)} pages", 
+                             timeout=timeout, batch_size=batch_size)
+                
+                # Cancel remaining futures that haven't completed
+                for future in future_to_page:
+                    if not future.done():
+                        future.cancel()
+                        page_num = future_to_page[future]
+                        logger.debug(f"Cancelled slow page {page_num + 1}")
+                        stats["failed"] += 1
         
         # Sort by page number
         results.sort(key=lambda x: x[0])
         return results
 
     def _extract_single_page_robust(self, file_path: str, page_num: int, stats: Dict[str, int]) -> str:
-        """Extract single page with multi-library fallback for maximum accuracy."""
+        """Extract single page with single fast method - skip blank pages quickly."""
         
-        # Method 1: pdfplumber (best for complex layouts, tables)
+        # Only use pdfplumber - fastest and most reliable
         try:
             with pdfplumber.open(file_path) as pdf:
-                page = pdf.pages[page_num]
-                text = page.extract_text()
-                if text and len(text.strip()) > 50:  # Good quality threshold
-                    stats["pdfplumber"] += 1
-                    return text
-        except:
-            pass
+                if page_num < len(pdf.pages):
+                    page = pdf.pages[page_num]
+                    text = page.extract_text()
+                    if text and len(text.strip()) > 3:  # Skip truly blank pages
+                        stats["pdfplumber"] += 1
+                        return text
+        except Exception:
+            pass  # Fail silently for speed
         
-        # Method 2: PyMuPDF (fast, good for images + text)
-        try:
-            doc = fitz.open(file_path)
-            page = doc[page_num]
-            text = page.get_text()
-            doc.close()
-            if text and len(text.strip()) > 50:
-                stats["pymupdf"] += 1
-                return text
-        except:
-            pass
-        
-        # Method 3: pdfminer (excellent for difficult PDFs)
-        try:
-            # Extract specific page using pdfminer
-            with open(file_path, 'rb') as fp:
-                text = extract_text(fp, page_numbers=[page_num], 
-                                  laparams=LAParams(boxes_flow=0.5, word_margin=0.1))
-                if text and len(text.strip()) > 20:
-                    stats["pdfminer"] += 1
-                    return text
-        except:
-            pass
-        
-        # Method 4: PyPDF2 (fallback)
-        try:
-            with open(file_path, 'rb') as f:
-                reader = PyPDF2.PdfReader(f)
-                text = reader.pages[page_num].extract_text()
-                if text and text.strip():
-                    stats["pypdf2"] += 1
-                    return text
-        except:
-            pass
-        
-        # All methods failed
+        # Page is blank or failed - skip quickly
         stats["failed"] += 1
-        logger.warning(f"All extraction methods failed for page {page_num + 1}")
-        return ""
+        return ""  # Return empty string for blank pages
 
     def _process_pdf_streaming(self, file_path: str, document_id: str, document_url: str) -> Generator[List[EmbeddingChunk], None, None]:
         """Stream process PDF in small batches."""

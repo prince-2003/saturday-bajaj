@@ -127,76 +127,57 @@ class RetrievalService:
                           total_chunks=total_chunks_processed,
                           batches_processed=batch_count)
 
-            # ✅ Step 2: Ultra-fast question processing
+            # ✅ Step 2: ULTRA-PARALLEL question processing - ALL AT ONCE
             all_questions = list(request.questions)
-            logger.info("Ultra-fast question embeddings", count=len(all_questions))
+            logger.info("ULTRA-PARALLEL question processing", count=len(all_questions))
             
-            # Generate question embeddings in batch
+            # ⚡ BATCH 1: Generate ALL question embeddings in one go
             question_embeddings = await self.embedding_service.generate_embeddings(all_questions)
             embedding_map = {question: emb for question, emb in zip(all_questions, question_embeddings)}
 
-            # ✅ Step 3: Ultra-concurrent question processing
-            semaphore = asyncio.Semaphore(self.max_concurrent_questions)  # Increased from 10 to 15
-            semaphore = asyncio.Semaphore(10)  # Increased concurrent questions for faster processing
+            # ⚡ BATCH 2: Get ALL search results in parallel (no semaphore limit!)
+            search_tasks = []
+            for question in all_questions:
+                query_embedding = embedding_map[question]
+                search_task = self.embedding_service.qdrant_service.search_similar(
+                    query_embedding=query_embedding, 
+                    top_k=7, 
+                    document_id=document_id
+                )
+                search_tasks.append(search_task)
             
-            async def process_single_question_optimized(i, question, doc_id):
-                async with semaphore:
-                    # Check memory before processing each question
-                    if not self._check_memory_and_cleanup():
-                        await asyncio.sleep(0.1)
-                    
-                    logger.info("Processing question", index=i+1, question=question[:100])
-
-                    # Use pre-generated embedding
-                    query_embedding = embedding_map[question]
-                    
-                    # Search for similar content
-                    context_chunks = await self.embedding_service.qdrant_service.search_similar(
-                        query_embedding=query_embedding, 
-                        top_k=7, 
-                        document_id=doc_id
-                    )
-                    
-                    # Get answer from LLM
-                    answer_result = await self.llm_service.answer_question_fast(question, context_chunks, doc_id)
-                    
-                    return {
-                        "answer": answer_result["answer"],
-                        "metadata": {
-                            "question_index": i,
-                            "confidence": answer_result["confidence"],
-                            "sources": answer_result["sources"],
-                            "reasoning": answer_result["reasoning"],
-                            "token_usage": answer_result.get("token_usage", 0)
-                        }
-                    }
-
-            # Process all questions concurrently but with memory management
-            tasks = [process_single_question_optimized(i, question, document_id) 
-                    for i, question in enumerate(request.questions)]
+            logger.info("Executing parallel searches", count=len(search_tasks))
+            all_search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
             
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # ⚡ BATCH 3: Process ALL questions using batch method
+            questions_data = []
+            for i, (question, search_result) in enumerate(zip(all_questions, all_search_results)):
+                if isinstance(search_result, Exception):
+                    logger.error("Search failed for question", question_index=i, error=str(search_result))
+                    search_result = []  # Use empty context
+                
+                questions_data.append({
+                    "question": question,
+                    "context_chunks": search_result,
+                    "index": i
+                })
             
-            # Handle results and exceptions
+            logger.info("Using batch LLM processing for maximum speed", count=len(questions_data))
+            results = await self.llm_service.answer_multiple_questions_batch(questions_data, document_id)
+            
+            # Handle results - extract answers and metadata
             all_answers = []
             all_metadata = []
             
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.error("Question processing failed", 
-                               question_index=i, 
-                               error=str(result))
-                    all_answers.append(f"Error processing question: {str(result)}")
-                    all_metadata.append({
-                        "question_index": i,
-                        "confidence": 0.0,
-                        "sources": [],
-                        "reasoning": "Processing error",
-                        "token_usage": 0
-                    })
-                else:
-                    all_answers.append(result["answer"])
-                    all_metadata.append(result["metadata"])
+            for result in results:
+                all_answers.append(result["answer"])
+                all_metadata.append({
+                    "question_index": result.get("question_index", 0),
+                    "confidence": result.get("confidence", 0.0),
+                    "sources": result.get("sources", []),
+                    "reasoning": result.get("reasoning", ""),
+                    "token_usage": result.get("token_usage", 0)
+                })
 
             # Calculate final metrics
             processing_time = time.time() - start_time

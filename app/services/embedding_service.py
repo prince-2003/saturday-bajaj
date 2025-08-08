@@ -12,6 +12,19 @@ from app.services.cache_service import IntelligentCacheService
 logger = structlog.get_logger(__name__)
 
 class EmbeddingService:
+    def _get_embedding_token_limit(self):
+        # Set token limits based on model name
+        model = settings.openai_embedding_model
+        if "large" in model:
+            return 32768
+        return 8192
+
+    def _truncate_text_to_token_limit(self, text: str, max_tokens: int) -> str:
+        # Simple whitespace split for now; can use tiktoken for more accuracy
+        tokens = text.split()
+        if len(tokens) > max_tokens:
+            return " ".join(tokens[:max_tokens])
+        return text
     """Manages embeddings operations using OpenAI."""
     
     def __init__(self, qdrant_service: QdrantService = None, cache_service: IntelligentCacheService = None):
@@ -42,37 +55,56 @@ class EmbeddingService:
         try:
             embeddings_map = {}
             texts_to_embed = []
-            
+            token_limit = self._get_embedding_token_limit()
             # First, check the cache for each text
             for text in texts:
                 cached_embedding = await self.cache_service.get_embedding_cache(text)
                 if cached_embedding:
                     embeddings_map[text] = cached_embedding
                 else:
-                    texts_to_embed.append(text)
-            
+                    # Truncate text to fit token limit
+                    safe_text = self._truncate_text_to_token_limit(text, token_limit)
+                    texts_to_embed.append(safe_text)
             logger.info("Embedding cache check", hits=len(embeddings_map), misses=len(texts_to_embed))
-
             # If there are any texts that were not in the cache, embed them in a batch
             if texts_to_embed:
-                response = await self.openai_client.embeddings.create(
-                    model=settings.openai_embedding_model,
-                    input=texts_to_embed
-                )
-                
-                new_embeddings = [embedding.embedding for embedding in response.data]
-                
-                # Add new embeddings to the map and set them in the cache
-                for text, embedding in zip(texts_to_embed, new_embeddings):
-                    embeddings_map[text] = embedding
-                    await self.cache_service.set_embedding_cache(text, embedding)
-                
-                logger.info("Generated and cached new embeddings", count=len(texts_to_embed))
-
+                # ⚡ ULTRA-FAST: Remove rate limiting delays, rely on OpenAI's built-in handling
+                try:
+                    logger.info("Generating embeddings at max speed", count=len(texts_to_embed))
+                    response = await self.openai_client.embeddings.create(
+                        model=settings.openai_embedding_model,
+                        input=texts_to_embed
+                    )
+                    new_embeddings = [embedding.embedding for embedding in response.data]
+                    
+                    # Add new embeddings to the map and set them in the cache
+                    for orig_text, embedding in zip(texts_to_embed, new_embeddings):
+                        embeddings_map[orig_text] = embedding
+                        await self.cache_service.set_embedding_cache(orig_text, embedding)
+                    
+                    logger.info("Generated embeddings at max speed", count=len(texts_to_embed))
+                    
+                except Exception as api_error:
+                    error_str = str(api_error).lower()
+                    if "rate limit" in error_str or "too many requests" in error_str:
+                        logger.warning("Rate limit hit, using exponential backoff")
+                        # Only retry on rate limits with minimal delay
+                        await asyncio.sleep(2.0)  # 2 second delay only
+                        response = await self.openai_client.embeddings.create(
+                            model=settings.openai_embedding_model,
+                            input=texts_to_embed
+                        )
+                        new_embeddings = [embedding.embedding for embedding in response.data]
+                        for orig_text, embedding in zip(texts_to_embed, new_embeddings):
+                            embeddings_map[orig_text] = embedding
+                            await self.cache_service.set_embedding_cache(orig_text, embedding)
+                        logger.info("Generated embeddings after rate limit", count=len(texts_to_embed))
+                    else:
+                        logger.error("Embedding API error", error=str(api_error))
+                        raise
             # Return the embeddings in the original order
-            final_embeddings = [embeddings_map[text] for text in texts]
+            final_embeddings = [embeddings_map[self._truncate_text_to_token_limit(text, token_limit)] for text in texts]
             return final_embeddings
-        
         except Exception as e:
             logger.error("Failed to generate embeddings", error=str(e))
             raise

@@ -5,6 +5,7 @@ import structlog
 import re
 from openai import AsyncOpenAI
 import anthropic
+import google.generativeai as genai
 import tiktoken
 
 from app.core.config import settings
@@ -69,6 +70,8 @@ class OptimizedLLMService:
         self.cache_service = cache_service
         self.openai_client = None
         self.anthropic_client = None
+        self.gemini_model = None
+
         self.encoding = None
         self.complexity_classifier = QuestionComplexityClassifier()
         
@@ -89,12 +92,19 @@ class OptimizedLLMService:
                 self.encoding = tiktoken.encoding_for_model(settings.openai_model)
                 logger.info("OpenAI client initialized", model=settings.openai_model)
             
-            # Initialize Anthropic client (Primary)
-            if settings.anthropic_api_key:
-                self.anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-                logger.info("Anthropic client initialized", model=settings.anthropic_model)
+            # Initialize Gemini client (New Primary)
+            if settings.google_api_key:
+                genai.configure(api_key=settings.google_api_key)
+                self.gemini_model = genai.GenerativeModel(settings.gemini_model)
+                logger.info("Gemini client initialized", 
+                           model=settings.gemini_model)
             
-            if not self.anthropic_client and not self.openai_client:
+            # Initialize Anthropic client (Commented but kept for fallback)
+            # if settings.anthropic_api_key:
+            #     self.anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+            #     logger.info("Anthropic client initialized", model=settings.anthropic_model)
+            
+            if not self.gemini_model and not self.openai_client:
                 logger.error("No LLM clients initialized - missing API keys")
                 
         except Exception as e:
@@ -107,7 +117,7 @@ class OptimizedLLMService:
         return len(text.split()) * 1.3  # Rough estimation
     
     def optimize_context(self, context_chunks: List[Dict[str, Any]], 
-                        query: str, max_tokens: int = 2000) -> str:
+                        query: str, max_tokens: int = 6000) -> str:  # Increased for testing - was 2000
         """Optimize context by selecting most relevant chunks within token limit."""
         if not context_chunks:
             logger.warning("No context chunks provided to optimize_context")
@@ -137,16 +147,16 @@ class OptimizedLLMService:
             
             logger.info(f"Processing chunk {i}", 
                        chunk_tokens=chunk_tokens,
-                       total_tokens=total_tokens,
-                       would_exceed=(total_tokens + chunk_tokens > available_tokens))
+                       total_tokens=total_tokens)
             
-            if total_tokens + chunk_tokens <= available_tokens:
-                context_parts.append(chunk_text)
-                total_tokens += chunk_tokens
-                logger.info(f"Added chunk {i}", new_total=total_tokens)
-            else:
-                logger.info(f"Rejected chunk {i} - would exceed token limit")
-                break
+            # COMMENTED OUT FOR TESTING - UNLIMITED CONTEXT
+            # if total_tokens + chunk_tokens <= available_tokens:
+            context_parts.append(chunk_text)
+            total_tokens += chunk_tokens
+            logger.info(f"Added chunk {i}", new_total=total_tokens)
+            # else:
+            #     logger.info(f"Rejected chunk {i} - would exceed token limit")
+            #     break
         
         final_context = "\n\n".join(context_parts)
         logger.info("Context optimization complete", 
@@ -157,12 +167,15 @@ class OptimizedLLMService:
     
     def create_optimized_system_prompt(self, question_type: str) -> str:
         """Create optimized system prompt based on question type."""
-        base_prompt = """You are an expert AI assistant specialized in analyzing insurance policies, legal documents, HR policies, and compliance documents. Provide accurate, concise answers based ONLY on the provided context."""
-        
+        base_prompt = (
+            "You are an expert AI assistant. Answer ONLY from the provided context. "
+            "Be extremely concise, precise, and avoid unnecessary details. "
+            "If possible, answer in a single sentence or bullet. Do NOT repeat the question."
+        )
         if question_type == "simple":
-            return base_prompt + "\n\nFor this question, provide a direct, factual answer in 1-3 sentences. Include specific numbers, periods, or conditions when mentioned in the context."
+            return base_prompt + "\n\nFor this question, provide a direct, factual answer in 1-2 sentences. Only include numbers, periods, or conditions if present in the context. Do NOT add extra explanation."
         else:
-            return base_prompt + "\n\nFor this complex question, provide a detailed explanation with reasoning. Include relevant conditions, limitations, and cross-references when applicable."
+            return base_prompt + "\n\nFor this complex question, provide a precise, minimal answer. Use a short summary or bullet points. Avoid long explanations."
     
     def create_optimized_user_prompt(self, context: str, question: str, question_type: str) -> str:
         """Create optimized user prompt."""
@@ -171,14 +184,53 @@ class OptimizedLLMService:
 
 Question: {question}
 
-Provide a direct, factual answer based on the context above."""
+Respond with a short, precise answer only. Maximum 2 sentences."""
         else:
             return f"""Document Context: {context}
 
 Question: {question}
 
-Provide a comprehensive answer with reasoning based on the document context."""
+Respond with a minimal, precise answer. Use a short summary or bullet points. Do not elaborate unless strictly necessary."""
     
+    async def answer_multiple_questions_batch(self, questions_data: List[Dict[str, Any]], 
+                                           document_id: str) -> List[Dict[str, Any]]:
+        """Process multiple questions in parallel batches for maximum speed."""
+        start_time = time.time()
+        logger.info("Batch processing questions", count=len(questions_data))
+        
+        # Process all questions in parallel without any semaphore limits
+        async def process_single_question(question_data):
+            question = question_data["question"]
+            context_chunks = question_data["context_chunks"]
+            index = question_data.get("index", 0)
+            
+            try:
+                result = await self.answer_question_fast(question, context_chunks, document_id)
+                result["question_index"] = index
+                return result
+            except Exception as e:
+                logger.error("Batch question processing failed", question_index=index, error=str(e))
+                return {
+                    "answer": f"Error processing question: {str(e)}",
+                    "confidence": 0.0,
+                    "sources": [],
+                    "reasoning": "Processing error",
+                    "token_usage": 0,
+                    "question_index": index
+                }
+        
+        # Execute ALL questions in parallel with no limits
+        tasks = [process_single_question(q_data) for q_data in questions_data]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        
+        processing_time = time.time() - start_time
+        logger.info("Batch processing completed", 
+                   count=len(results), 
+                   time_taken=f"{processing_time:.2f}s",
+                   avg_per_question=f"{processing_time/len(results):.2f}s")
+        
+        return results
+
     async def answer_question_fast(self, question: str, context_chunks: List[Dict[str, Any]], 
                                  document_id: str) -> Dict[str, Any]:
         """Fast question answering with caching and model routing."""
@@ -200,8 +252,8 @@ Provide a comprehensive answer with reasoning based on the document context."""
             # Classify question complexity
             complexity = self.complexity_classifier.classify(question)
             
-            # Optimize context - increase token limits for better context inclusion
-            max_context_tokens = 3000 if complexity == "simple" else 4000
+            # Optimize context - UNLIMITED TOKENS FOR TESTING
+            max_context_tokens = 20000  # Massive increase for testing - was 3000/4000
             context = self.optimize_context(context_chunks, question, max_context_tokens)
             
             logger.info("Context prepared for LLM", 
@@ -212,10 +264,14 @@ Provide a comprehensive answer with reasoning based on the document context."""
             if not context:
                 return self._create_no_context_response(question, start_time)
             
-            # Route to appropriate model - Prioritize Anthropic Claude for all questions
-            if self.anthropic_client:
-                answer_result = await self._answer_with_claude(question, context, complexity)
+            # Route to appropriate model - Prioritize Gemini for all questions
+            if self.gemini_model:
+                answer_result = await self._answer_with_gemini(question, context, complexity)
                 self.fast_model_usage += 1
+            # Claude fallback (commented out - kept for reference)
+            # elif self.anthropic_client:
+            #     answer_result = await self._answer_with_claude(question, context, complexity)
+            #     self.fast_model_usage += 1
             elif self.openai_client:
                 answer_result = await self._answer_with_openai(question, context, complexity)
                 self.slow_model_usage += 1
@@ -225,7 +281,7 @@ Provide a comprehensive answer with reasoning based on the document context."""
             # Calculate total processing time
             answer_result["processing_time"] = time.time() - start_time
             answer_result["from_cache"] = False
-            answer_result["model_used"] = "claude-haiku" if "claude" in answer_result.get("model", "") else "gpt-4-turbo"
+            answer_result["model_used"] = answer_result.get("model", "unknown")
             answer_result["complexity"] = complexity
             
             # Cache the result
@@ -243,48 +299,141 @@ Provide a comprehensive answer with reasoning based on the document context."""
             logger.error("Failed to answer question", error=str(e))
             return self._create_error_response(question, str(e), start_time)
     
-    async def _answer_with_claude(self, question: str, context: str, complexity: str) -> Dict[str, Any]:
-        """Answer question using Claude-3-Haiku."""
+    async def _answer_with_gemini(self, question: str, context: str, complexity: str) -> Dict[str, Any]:
+        """Answer question using Google Gemini with massive context support."""
         try:
+            # Always use gemini-2.5-flash for all queries
+            model = self.gemini_model
+            model_name = settings.gemini_model
             system_prompt = self.create_optimized_system_prompt(complexity)
             user_prompt = self.create_optimized_user_prompt(context, question, complexity)
+            full_prompt = f"{system_prompt}\n\n{user_prompt}"
             
-            max_tokens = settings.anthropic_max_tokens if complexity == "simple" else settings.anthropic_max_tokens * 1.5
-            
-            response = await asyncio.wait_for(
-                self.anthropic_client.messages.create(
-                    model=settings.anthropic_model,
-                    max_tokens=int(max_tokens),
-                    temperature=settings.temperature,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}]
-                ),
-                timeout=settings.llm_timeout
-            )
-            
-            answer = response.content[0].text.strip()
-            
-            return {
-                "answer": answer,
-                "confidence": self._calculate_confidence_fast(context, question, answer),
-                "model": "claude-3-haiku",
-                "token_usage": response.usage.input_tokens + response.usage.output_tokens if response.usage else 0,
-                "sources": self._extract_sources_fast(context),
-                "reasoning": f"Answered using Claude-3-Haiku for {complexity} question"
-            }
-            
-        except asyncio.TimeoutError:
-            logger.error("Claude request timed out")
-            if settings.fallback_to_gpt4 and self.openai_client:
-                logger.info("Falling back to OpenAI")
-                return await self._answer_with_openai(question, context, complexity)
-            raise
+            # ⚡ ULTRA-FAST: Remove retry delays, single attempt with fallback
+            try:
+                logger.info("Gemini processing at max speed", model=model_name)
+                response = await asyncio.to_thread(
+                    model.generate_content,
+                    full_prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=settings.gemini_max_tokens,
+                        temperature=settings.temperature,
+                    )
+                )
+                if not response.text:
+                    raise ValueError("Empty response from Gemini")
+                
+                answer = response.text
+                return {
+                    "answer": answer,
+                    "confidence": self._calculate_confidence_fast(context, question, answer),
+                    "model": model_name,
+                    "token_usage": len(full_prompt.split()) + len(answer.split()),
+                    "sources": self._extract_sources_fast(context),
+                    "reasoning": f"Answered using {model_name} for {complexity} question"
+                }
+                
+            except Exception as api_error:
+                error_str = str(api_error).lower()
+                if ("quota" in error_str or "rate limit" in error_str or 
+                    "too many requests" in error_str or "429" in error_str):
+                    logger.warning("Gemini rate limit, single retry")
+                    await asyncio.sleep(1.0)  # Single 1-second retry only
+                    response = await asyncio.to_thread(
+                        model.generate_content,
+                        full_prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            max_output_tokens=settings.gemini_max_tokens,
+                            temperature=settings.temperature,
+                        )
+                    )
+                    answer = response.text
+                    return {
+                        "answer": answer,
+                        "confidence": self._calculate_confidence_fast(context, question, answer),
+                        "model": model_name,
+                        "token_usage": len(full_prompt.split()) + len(answer.split()),
+                        "sources": self._extract_sources_fast(context),
+                        "reasoning": f"Answered using {model_name} after rate limit"
+                    }
+                else:
+                    logger.error("Gemini API error", error=str(api_error))
+                    raise
         except Exception as e:
-            logger.error("Claude request failed", error=str(e))
-            if settings.fallback_to_gpt4 and self.openai_client:
+            logger.error("Gemini request failed", error=str(e))
+            if self.openai_client:
                 logger.info("Falling back to OpenAI")
                 return await self._answer_with_openai(question, context, complexity)
             raise
+
+    # CLAUDE METHOD - COMMENTED OUT BUT KEPT FOR REFERENCE
+    # async def _answer_with_claude(self, question: str, context: str, complexity: str) -> Dict[str, Any]:
+    #     """Answer question using Claude-3-Haiku."""
+    #     try:
+    #         system_prompt = self.create_optimized_system_prompt(complexity)
+    #         user_prompt = self.create_optimized_user_prompt(context, question, complexity)
+    #         
+    #         max_tokens = settings.anthropic_max_tokens * 2  # Increased for testing - was conditional based on complexity
+    #         
+    #         # Add rate limiting and retry logic for Claude
+    #         max_retries = 3
+    #         base_delay = 2.0
+    #         
+    #         for attempt in range(max_retries):
+    #             try:
+    #                 if attempt > 0:
+    #                     delay = base_delay * (2 ** attempt)
+    #                     logger.info(f"Claude rate limit retry {attempt + 1}, waiting {delay}s")
+    #                     await asyncio.sleep(delay)
+    #                 
+    #                 response = await asyncio.wait_for(
+    #                     self.anthropic_client.messages.create(
+    #                         model=settings.anthropic_model,
+    #                         max_tokens=int(max_tokens),
+    #                         temperature=settings.temperature,
+    #                         system=system_prompt,
+    #                         messages=[{"role": "user", "content": user_prompt}]
+    #                     ),
+    #                     timeout=settings.llm_timeout + (attempt * 10)  # Increase timeout on retries
+    #                 )
+    #                 
+    #                 answer = response.content[0].text.strip()
+    #                 
+    #                 return {
+    #                     "answer": answer,
+    #                     "confidence": self._calculate_confidence_fast(context, question, answer),
+    #                     "model": "claude-3-haiku",
+    #                     "token_usage": response.usage.input_tokens + response.usage.output_tokens if response.usage else 0,
+    #                     "sources": self._extract_sources_fast(context),
+    #                     "reasoning": f"Answered using Claude-3-Haiku for {complexity} question (attempt {attempt + 1})"
+    #                 }
+    #                 
+    #             except Exception as api_error:
+    #                 error_str = str(api_error).lower()
+    #                 if ("rate limit" in error_str or "too many requests" in error_str or 
+    #                     "overloaded" in error_str or "529" in error_str):
+    #                     if attempt < max_retries - 1:
+    #                         logger.warning(f"Claude rate limit/overload, retrying... (attempt {attempt + 1}/{max_retries})")
+    #                         continue
+    #                     else:
+    #                         logger.error("Claude rate limit exceeded, max retries reached")
+    #                         raise
+    #                 else:
+    #                     logger.error("Claude API error", error=str(api_error))
+    #                     raise
+    #         
+    #     except asyncio.TimeoutError:
+    #         logger.error("Claude request timed out")
+    #         if settings.fallback_to_gpt4 and self.openai_client:
+    #             logger.info("Falling back to OpenAI")
+    #             return await self._answer_with_openai(question, context, complexity)
+    #         raise
+    #     except Exception as e:
+    #         logger.error("Claude request failed", error=str(e))
+    #         if settings.fallback_to_gpt4 and self.openai_client:
+    #             logger.info("Falling back to OpenAI")
+    #             return await self._answer_with_openai(question, context, complexity)
+    #         raise
     
     async def _answer_with_openai(self, question: str, context: str, complexity: str) -> Dict[str, Any]:
         """Answer question using OpenAI GPT-4-Turbo."""
@@ -292,31 +441,56 @@ Provide a comprehensive answer with reasoning based on the document context."""
             system_prompt = self.create_optimized_system_prompt(complexity)
             user_prompt = self.create_optimized_user_prompt(context, question, complexity)
             
-            max_tokens = settings.max_tokens if complexity == "complex" else int(settings.max_tokens * 0.7)
+            max_tokens = settings.max_tokens * 2  # Increased for testing - was conditional based on complexity
             
-            response = await asyncio.wait_for(
-                self.openai_client.chat.completions.create(
-                    model=settings.openai_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=settings.temperature
-                ),
-                timeout=settings.llm_timeout
-            )
+            # Add rate limiting and retry logic for OpenAI
+            max_retries = 3
+            base_delay = 1.5
             
-            answer = response.choices[0].message.content.strip()
-            
-            return {
-                "answer": answer,
-                "confidence": self._calculate_confidence_fast(context, question, answer),
-                "model": "gpt-4-turbo",
-                "token_usage": response.usage.total_tokens if response.usage else 0,
-                "sources": self._extract_sources_fast(context),
-                "reasoning": f"Answered using GPT-4-Turbo for {complexity} question"
-            }
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        delay = base_delay * (2 ** attempt)
+                        logger.info(f"OpenAI rate limit retry {attempt + 1}, waiting {delay}s")
+                        await asyncio.sleep(delay)
+                    
+                    response = await asyncio.wait_for(
+                        self.openai_client.chat.completions.create(
+                            model=settings.openai_model,
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt}
+                            ],
+                            max_tokens=max_tokens,
+                            temperature=settings.temperature
+                        ),
+                        timeout=settings.llm_timeout + (attempt * 10)
+                    )
+                    
+                    answer = response.choices[0].message.content.strip()
+                    
+                    return {
+                        "answer": answer,
+                        "confidence": self._calculate_confidence_fast(context, question, answer),
+                        "model": "gpt-4-turbo",
+                        "token_usage": response.usage.total_tokens if response.usage else 0,
+                        "sources": self._extract_sources_fast(context),
+                        "reasoning": f"Answered using GPT-4-Turbo for {complexity} question (attempt {attempt + 1})"
+                    }
+                    
+                except Exception as api_error:
+                    error_str = str(api_error).lower()
+                    if ("rate limit" in error_str or "too many requests" in error_str or 
+                        "quota" in error_str or "429" in error_str):
+                        if attempt < max_retries - 1:
+                            logger.warning(f"OpenAI rate limit, retrying... (attempt {attempt + 1}/{max_retries})")
+                            continue
+                        else:
+                            logger.error("OpenAI rate limit exceeded, max retries reached")
+                            raise
+                    else:
+                        logger.error("OpenAI API error", error=str(api_error))
+                        raise
             
         except asyncio.TimeoutError:
             logger.error("OpenAI request timed out")
