@@ -50,11 +50,11 @@ class OptimizedDocumentProcessor:
         self.chunk_size = settings.chunk_size
         self.chunk_overlap = settings.chunk_overlap
         
-        # 🚀 PRODUCTION OPTIMIZED: 800MB memory available - USE FULL 800MB!
-        self.max_memory_usage = 1.00  # 100% of 800MB = 800MB fully utilized
-        self.batch_size = 800  # MASSIVE: 800 pages at once (increased from 200)
-        self.embedding_batch_size = 250  # MAXIMUM: 250 embeddings per API call (increased from 150)
-        self.max_workers = min(32, cpu_count() * 4)  # Maximum workers for full utilization
+        # 🚀 PRODUCTION OPTIMIZED: 1200MB memory available - USE FULL 1200MB!
+        self.max_memory_usage = 1.00  # 100% of 1200MB = 1200MB fully utilized
+        self.batch_size = 1000  # MASSIVE: 1000 pages at once (increased from 800)
+        self.embedding_batch_size = 300  # MAXIMUM: 300 embeddings per API call (increased from 250)
+        self.max_workers = min(40, cpu_count() * 5)  # Maximum workers for full utilization
         
         # Cost-optimized chunking configuration
         self.use_semantic_chunking = True
@@ -66,10 +66,10 @@ class OptimizedDocumentProcessor:
         self.max_tokens_per_chunk = 800
         self.enable_chunk_compression = True
         
-        logger.info("PRODUCTION DocumentProcessor initialized - MAXIMUM 800MB USAGE", 
+        logger.info("PRODUCTION DocumentProcessor initialized - MAXIMUM 1200MB USAGE", 
                    batch_size=self.batch_size,
                    memory_limit=f"{self.max_memory_usage*100:.0f}%",
-                   memory_available="800MB - FULL UTILIZATION",
+                   memory_available="1200MB - FULL UTILIZATION",
                    max_workers=self.max_workers,
                    embedding_batch_size=self.embedding_batch_size)
 
@@ -185,18 +185,18 @@ class OptimizedDocumentProcessor:
                        total_chunks=len(all_chunks),
                        pages=total_pages)
 
-            # STAGE 2: Yield chunks in batches - MAXIMUM performance with full 800MB
+            # STAGE 2: Yield chunks in batches - MAXIMUM performance with full 1200MB
             async def chunk_generator():
-                batch_size = 100  # DOUBLED: Process 100 chunks at a time (was 50)
+                batch_size = 150  # INCREASED: Process 150 chunks at a time (was 100)
                 for i in range(0, len(all_chunks), batch_size):
                     # Create a COPY of the batch to prevent reference issues
                     batch = [chunk for chunk in all_chunks[i:i + batch_size]]
                     yield batch
                     
                     # Minimal memory cleanup - only when absolutely necessary
-                    if i % (batch_size * 10) == 0:  # Every 10 batches (1000 chunks)
+                    if i % (batch_size * 15) == 0:  # Every 15 batches (2250 chunks)
                         memory_percent = psutil.virtual_memory().percent
-                        if memory_percent > 98:  # Only cleanup at 98% usage
+                        if memory_percent > 99:  # Only cleanup at 99% usage
                             logger.info(f"Memory cleanup at batch {i//batch_size + 1}, memory: {memory_percent}%")
                             gc.collect()  # Light garbage collection only
 
@@ -504,7 +504,99 @@ class OptimizedDocumentProcessor:
             logger.error("Failed to process email", error=str(e))
             raise ValueError(f"Failed to process email: {str(e)}")
 
+    def _create_chunks_generator(self, text: str, document_url: str, batch_size: int = 150):
+        """Create chunks in batches to enable streaming processing and immediate memory cleanup."""
+        document_id = self._generate_document_id(document_url)
+        chunk_index = 0
+        
+        paragraphs = self._split_into_paragraphs(text)
+        current_batch = []
+        
+        current_chunk = ""
+        current_chunk_paragraphs = []
+        
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+                
+            # Compress paragraph if enabled
+            if self.enable_chunk_compression:
+                paragraph = self._compress_text(paragraph)
+            
+            para_token_count = len(paragraph.split()) * 0.75
+            current_token_count = len(current_chunk.split()) * 0.75
+            
+            # Check if we need to create a new chunk
+            if current_token_count > 0 and (
+                current_token_count + para_token_count > self.max_tokens_per_chunk or
+                len(current_chunk.split()) + len(paragraph.split()) > self.max_paragraph_chunk_size
+            ):
+                if current_chunk.strip() and len(current_chunk.split()) >= self.min_chunk_size:
+                    chunk = self._create_chunk(
+                        current_chunk.strip(), 
+                        document_id, 
+                        chunk_index, 
+                        document_url
+                    )
+                    current_batch.append(chunk)
+                    chunk_index += 1
+                    
+                    # Yield batch when it reaches batch_size
+                    if len(current_batch) >= batch_size:
+                        yield current_batch
+                        current_batch = []
+                
+                # Handle overlap
+                if self.chunk_overlap > 0 and current_chunk_paragraphs:
+                    overlap_context = self._get_overlap_context(current_chunk_paragraphs[-1])
+                    current_chunk = overlap_context + "\n\n" + paragraph if overlap_context else paragraph
+                else:
+                    current_chunk = paragraph
+                current_chunk_paragraphs = [paragraph]
+            else:
+                if current_chunk:
+                    current_chunk += "\n\n" + paragraph
+                else:
+                    current_chunk = paragraph
+                current_chunk_paragraphs.append(paragraph)
+        
+        # Add the last chunk
+        if current_chunk.strip() and len(current_chunk.split()) >= self.min_chunk_size:
+            chunk = self._create_chunk(
+                current_chunk.strip(), 
+                document_id, 
+                chunk_index, 
+                document_url
+            )
+            current_batch.append(chunk)
+        
+        # Yield final batch if not empty
+        if current_batch:
+            yield current_batch
+
     def _create_chunks(self, text: str, document_url: str) -> List[EmbeddingChunk]:
+        """Legacy method - collects all chunks for backward compatibility."""
+        all_chunks = []
+        for batch in self._create_chunks_generator(text, document_url, batch_size=1000):
+            all_chunks.extend(batch)
+        
+        # Statistics
+        if all_chunks:
+            total_tokens = sum(len(chunk.text.split()) * 0.75 for chunk in all_chunks)
+            avg_tokens_per_chunk = total_tokens / len(all_chunks)
+            # Skip expensive max calculation for performance
+            max_tokens = 0
+        else:
+            total_tokens = avg_tokens_per_chunk = max_tokens = 0
+        
+        logger.info("Created cost-optimized chunks", 
+                    total_chunks=len(all_chunks),
+                    estimated_total_tokens=int(total_tokens),
+                    avg_tokens_per_chunk=int(avg_tokens_per_chunk),
+                    max_tokens_per_chunk=int(max_tokens))
+        
+        return all_chunks
         """Create chunks from text content using cost-optimized paragraph-based strategy."""
         chunks = []
         document_id = self._generate_document_id(document_url)
@@ -609,32 +701,24 @@ class OptimizedDocumentProcessor:
         Compresses text by replacing long, redundant phrases with shorter equivalents.
         """
         replacement_map = {
-            # General Legal & Insurance Phrases
+            # General legal and formal phrases
             r'\bwhich shall be the basis of this contract and is deemed to be incorporated herein\b': '[part of contract]',
-            r'\bfollowing the Medical Advice of a duly qualified Medical Practitioner\b': 'on a doctor\'s advice',
-            r'\bThe Company shall indemnify the Hospital or the Insured, Reasonable and Customary Charges incurred for Medically Necessary Treatment\b': 'Company will pay for approved medical costs',
-            r'\bThe Company shall not be liable to make any payment by the Policy, in respect of any expenses incurred in connection with or in respect of\b': 'Policy excludes payment for',
-            r'\bsubject to the Definitions, Terms, Exclusions, Conditions contained herein and limits\b': 'subject to policy terms and limits',
-            r'\bhas applied to National Insurance Company Ltd\. \(hereinafter called the Company\)\b': 'has applied to the Company',
+            r'\bfollowing the advice of a duly qualified professional\b': 'on professional advice',
+            r'\bshall not be liable to make any payment in respect of any expenses incurred in connection with or in respect of\b': 'excludes payment for',
+            r'\bsubject to the terms, conditions, and limitations contained herein\b': 'subject to terms and conditions',
             r'\bsudden, unforeseen and involuntary event caused by external, visible and violent means\b': '[definition of Accident]',
-            r'\bunder the supervision of a registered and qualified medical practitioner\b': 'under a qualified doctor\'s supervision',
-            r'\b(shall be|are) accessible to the insurance company\'s authorized representative\b': 'accessible to the insurer',
+            r'\bunder the supervision of a registered and qualified professional\b': 'under professional supervision',
+            r'\baccessible to the authorized representative\b': 'accessible to representative',
             
             # Specific recurring clauses
-            r'\bIn the event of hospitalisation/ domiciliary hospitalisation, the insured person/insured person\'s representative shall notify\b': 'For hospitalization, insured must notify',
+            r'\bIn the event of \w+, the person/representative shall notify\b': 'Must notify for events',
             r'\b(for|under) any of the following circumstances\b': 'if:',
-            r'\bThe services offered by a TPA shall not include\b': 'TPA services exclude:',
-            r'\bThe policy shall be void and all premium paid thereon shall be forfeited to the Company\b': 'Policy will be voided',
             r'\bin the event of misrepresentation, mis description or non-disclosure of any material fact\b': 'for any non-disclosure',
 
-            # Repeated Header/Footer info (can be removed entirely)
-            r'National Insurance Co\. Ltd\.': '',
-            r'Premises No\. 18-0374, Plot no\. CBD-81, New Town, Kolkata - 700156': '',
-            r'National Parivar Mediclaim Plus Policy': '',
-            r'UIN: NICHLIP25039V032425': '',
-            r'Page \d+ of \d+': ''
+            # Remove repeated header/footer info
+            r'Page \d+ of \d+': '',
+            r'\s+': ' '  # Final cleanup of excessive whitespace
         }
-        
         # Apply all replacements
         for pattern, replacement in replacement_map.items():
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
@@ -704,7 +788,7 @@ class OptimizedDocumentProcessor:
             metadata={
                 "page_number": self._extract_page_number(text),
                 "section": self._extract_section(text),
-                "clause_type": self._classify_clause_type(text),
+
                 "document_url": document_url
             }
         )
@@ -744,14 +828,14 @@ class OptimizedDocumentProcessor:
                 if match:
                     return match.group(0).strip()
         
-        insurance_sections = [
-            'coverage', 'benefits', 'exclusions', 'limitations', 'definitions',
-            'waiting period', 'grace period', 'claims', 'premium', 'renewal',
-            'policy terms', 'conditions', 'procedures', 'eligibility'
+        document_sections = [
+            'introduction', 'overview', 'definitions', 'terms', 'conditions',
+            'procedures', 'requirements', 'limitations', 'restrictions',
+            'responsibilities', 'obligations', 'rights', 'benefits'
         ]
         
         text_lower = text.lower()
-        for section in insurance_sections:
+        for section in document_sections:
             if section in text_lower:
                 for line in lines[:3]:
                     if section in line.lower():
@@ -759,35 +843,5 @@ class OptimizedDocumentProcessor:
                         
         return None
     
-    def _classify_clause_type(self, text: str) -> Optional[str]:
-        """Classify the type of clause based on content with enhanced patterns."""
-        text_lower = text.lower()
-        
-        classification_patterns = {
-            'coverage_clause': ['cover', 'benefit', 'include', 'eligible', 'entitle', 'reimburse', 'payable', 'treatment covered', 'medical expenses', 'hospital benefit'],
-            'exclusion_clause': ['exclude', 'not cover', 'limitation', 'restrict', 'prohibit', 'except', 'does not include', 'not eligible', 'not payable'],
-            'condition_clause': ['condition', 'require', 'must', 'shall', 'obligation', 'duty', 'responsibility', 'comply', 'fulfill', 'subject to'],
-            'payment_clause': ['premium', 'payment', 'cost', 'fee', 'charge', 'amount', 'installment', 'due', 'payable', 'billing'],
-            'time_clause': ['waiting period', 'grace period', 'time', 'duration', 'deadline', 'within', 'before', 'after', 'days', 'months', 'years'],
-            'claims_clause': ['claim', 'settlement', 'procedure', 'process', 'submit', 'documentation', 'proof', 'evidence', 'notification'],
-            'definitions_clause': ['means', 'defined as', 'definition', 'interpret', 'refer to', 'shall mean', 'is defined', 'for the purpose'],
-            'renewal_clause': ['renewal', 'renew', 'extend', 'continuation', 'expiry', 'terminate', 'cancellation', 'policy period']
-        }
-        
-        category_scores = {}
-        for category, keywords in classification_patterns.items():
-            score = 0
-            for keyword in keywords:
-                if keyword in text_lower:
-                    score += len(keyword.split())
-            category_scores[category] = score
-        
-        if category_scores:
-            best_category = max(category_scores, key=category_scores.get)
-            if category_scores[best_category] > 0:
-                return best_category
-        
-        return 'general_clause'
-
 # Create aliases for compatibility
 DocumentProcessor = OptimizedDocumentProcessor

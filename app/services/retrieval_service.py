@@ -37,19 +37,19 @@ class RetrievalService:
             from app.services.document_processor import OptimizedDocumentProcessor
             self.document_processor = OptimizedDocumentProcessor()
         
-        # 🚀 PRODUCTION OPTIMIZED: 800MB memory available - USE FULL 800MB!
-        self.max_memory_threshold = 1.00  # 100% of 800MB = 800MB fully utilized
-        self.chunk_processing_batch_size = 10000  # MASSIVE: 10,000 chunks per batch (doubled from 5000)
-        self.embedding_batch_size = 250  # MAXIMUM: 250 embeddings per API call (increased from 150)
-        self.max_concurrent_questions = 50  # MAXIMUM: 50 concurrent questions (doubled from 25)
-        self.memory_check_frequency = 50  # Check even less frequently for speed (was 20)
+        # 🚀 PRODUCTION OPTIMIZED: 1200MB memory available - USE FULL 1200MB!
+        self.max_memory_threshold = 1.00  # 100% of 1200MB = 1200MB fully utilized
+        self.chunk_processing_batch_size = 15000  # MASSIVE: 15,000 chunks per batch (increased from 10000)
+        self.embedding_batch_size = 300  # MAXIMUM: 300 embeddings per API call (increased from 250)
+        self.max_concurrent_questions = 75  # MAXIMUM: 75 concurrent questions (increased from 50)
+        self.memory_check_frequency = 100  # Check even less frequently for speed (was 50)
         
         # Ultra-fast caching
         self._collection_exists_cache = None
         
-        logger.info("PRODUCTION mode initialized - MAXIMUM 800MB USAGE", 
+        logger.info("PRODUCTION mode initialized - MAXIMUM 1200MB USAGE", 
                    memory_threshold=f"{self.max_memory_threshold*100:.0f}%",
-                   memory_available="800MB - FULL UTILIZATION",
+                   memory_available="1200MB - FULL UTILIZATION",
                    chunk_batch_size=self.chunk_processing_batch_size,
                    embedding_batch_size=self.embedding_batch_size,
                    concurrent_questions=self.max_concurrent_questions)
@@ -109,13 +109,13 @@ class RetrievalService:
                 )
                 metadata, chunk_generator = await document_task
                 
-                # 🚀 NEW STAGED PROCESSING: Process everything in memory first
+                # 🚀 STREAMING PIPELINE: Process with immediate memory cleanup
                 store_task = asyncio.wait_for(
                     self._process_and_store_all_chunks_staged(chunk_generator, document_id),
-                    timeout=300.0  # 5 minutes for entire staged processing
+                    timeout=300.0  # 5 minutes for entire streaming processing
                 )
                 total_stored = await store_task
-                logger.info(f"Staged processing completed: {total_stored} chunks processed")
+                logger.info(f"Streaming processing completed: {total_stored} chunks processed")
 
             # ⚡ STEP 3: MAXIMUM SPEED question processing with timeout
             # Generate ALL embeddings at once
@@ -299,94 +299,173 @@ class RetrievalService:
 
     async def _process_and_store_all_chunks_staged(self, chunk_generator, document_id: str):
         """
-        STAGED PROCESSING: Process all chunks in memory first, then embeddings, then storage.
-        Uses available memory (800MB) more efficiently for maximum speed.
+        🚀 STREAMING PIPELINE: Process, embed, store, and cleanup in batches for maximum memory efficiency.
+        Each batch: Generate embeddings → Delete raw text → Store in DB → Delete embeddings
         """
-        logger.info("Starting STAGED processing - all chunks in memory first")
+        logger.info("Starting STREAMING processing with immediate memory cleanup")
         start_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
         logger.info(f"Starting memory usage: {start_memory_mb}MB")
         
-        # 🚀 STAGE 1: Collect ALL chunks in memory first
-        all_chunks = []
-        chunk_count = 0
+        stored_count = 0
+        batch_num = 0
         
-        logger.info("STAGE 1: Processing all chunks into memory...")
+        # 🚀 STREAMING PIPELINE: Process each batch immediately
         async for chunk_batch in chunk_generator:
-            all_chunks.extend(chunk_batch)
-            chunk_count += len(chunk_batch)
+            if not chunk_batch:
+                continue
+                
+            batch_num += 1
+            batch_size = len(chunk_batch)
+            logger.info(f"🔄 STREAMING BATCH {batch_num}: Processing {batch_size} chunks")
             
-            # Log progress every 1000 chunks
-            if chunk_count % 1000 == 0:
-                memory_mb = psutil.virtual_memory().used // (1024 * 1024)
-                logger.info(f"Processed {chunk_count} chunks, memory: {memory_mb}MB")
-        
-        total_chunks = len(all_chunks)
-        stage1_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
-        logger.info(f"STAGE 1 COMPLETE: {total_chunks} chunks in memory, memory: {stage1_memory_mb}MB")
-        
-        # 🚀 STAGE 2: Generate ALL embeddings at once
-        logger.info("STAGE 2: Generating ALL embeddings...")
-        texts = [chunk.text for chunk in all_chunks]
-        
-        # Process in large batches but keep everything in memory
-        all_embeddings = await self.embedding_service.generate_embeddings(texts)
-        
-        # Validate embeddings were generated
-        valid_embeddings = [e for e in all_embeddings if e is not None and len(e) > 0]
-        logger.info(f"Embedding validation: {len(valid_embeddings)}/{len(all_embeddings)} valid embeddings")
-        
-        # Attach embeddings to chunks
-        for chunk, embedding in zip(all_chunks, all_embeddings):
-            chunk.embedding = embedding
+            # STEP 1: Generate embeddings for this batch
+            logger.info(f"📊 STEP 1: Generating embeddings for batch {batch_num}")
+            try:
+                texts = [chunk.text for chunk in chunk_batch]
+                embeddings = await self.embedding_service.generate_embeddings(texts)
+                
+                # Attach embeddings to chunks
+                valid_embeddings = 0
+                for i, (chunk, embedding) in enumerate(zip(chunk_batch, embeddings)):
+                    if embedding is not None and len(embedding) > 0:
+                        chunk.embedding = embedding
+                        valid_embeddings += 1
+                        # DEBUG: Log first embedding to verify it's not null
+                        if i == 0:
+                            logger.info(f"🔍 DEBUG: First embedding sample: [{embedding[0]:.4f}, {embedding[1]:.4f}, ...] (length: {len(embedding)})")
+                    else:
+                        chunk.embedding = None
+                        logger.warning(f"❌ Empty embedding for chunk {i}")
+                
+                logger.info(f"✅ STEP 1 COMPLETE: {valid_embeddings}/{batch_size} embeddings generated for batch {batch_num}")
+                
+                # Clean up texts array immediately
+                del texts, embeddings
+                
+            except Exception as e:
+                logger.error(f"❌ STEP 1 FAILED: Embedding generation failed for batch {batch_num}: {str(e)}")
+                continue
+            # STEP 2: Store embeddings in vector DB FIRST (before deleting text)
+            logger.info(f"💾 STEP 2: Storing batch {batch_num} in vector DB")
+            try:
+                storage_result = await self.embedding_service.qdrant_service.store_embeddings(chunk_batch)
+                
+                if storage_result:
+                    stored_count += batch_size
+                    logger.info(f"✅ STEP 2 COMPLETE: Batch {batch_num} stored successfully ({batch_size} chunks)")
+                    
+                    # STEP 3: IMMEDIATELY delete raw text AND embeddings to free memory (since stored successfully)
+                    logger.info(f"🗑️ STEP 3: Freeing both text and embedding memory for batch {batch_num}")
+                    text_memory_freed = 0
+                    embedding_memory_freed = 0
+                    
+                    for chunk in chunk_batch:
+                        # Delete raw text
+                        if hasattr(chunk, 'text') and chunk.text:
+                            text_memory_freed += len(chunk.text)
+                            chunk.text = None
+                        
+                        # Delete embeddings
+                        if hasattr(chunk, 'embedding') and chunk.embedding:
+                            embedding_memory_freed += len(chunk.embedding) * 4  # 4 bytes per float
+                            chunk.embedding = None
+                    
+                    logger.info(f"✅ STEP 3 COMPLETE: Freed {text_memory_freed // 1024}KB text + {embedding_memory_freed // 1024}KB embeddings")
+                    
+                else:
+                    logger.error(f"❌ STEP 2 FAILED: Batch {batch_num} storage failed")
+                    
+            except Exception as e:
+                logger.error(f"❌ STEP 2 EXCEPTION: Batch {batch_num} storage failed: {str(e)}")
             
-        stage2_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
-        logger.info(f"STAGE 2 COMPLETE: {len(all_embeddings)} embeddings generated, memory: {stage2_memory_mb}MB")
+            # Memory cleanup every 3 batches
+            if batch_num % 3 == 0:
+                import gc
+                before_cleanup = psutil.virtual_memory().percent
+                gc.collect()
+                after_cleanup = psutil.virtual_memory().percent
+                logger.info(f"🧹 Memory cleanup after batch {batch_num}: {before_cleanup:.1f}% → {after_cleanup:.1f}%")
+            
+            # Clear batch reference
+            del chunk_batch
         
-        # Clear text array to free memory
-        del texts, all_embeddings
+        # Final cleanup
+        logger.info("🧹 FINAL CLEANUP: Clearing remaining references")
+        import gc
+        final_before = psutil.virtual_memory().percent
+        gc.collect()
+        final_after = psutil.virtual_memory().percent
         
-        # 🚀 STAGE 3: Store ALL chunks in vector DB with concurrent batches
-        logger.info("STAGE 3: Storing all chunks in vector DB with concurrent processing...")
+        final_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
+        total_memory_freed = start_memory_mb - final_memory_mb
         
-        # Store in mega-batches for speed with concurrent processing
+        logger.info(f"🎉 STREAMING PIPELINE COMPLETE: "
+                   f"Stored {stored_count} chunks across {batch_num} batches, "
+                   f"Memory: {start_memory_mb}MB → {final_memory_mb}MB "
+                   f"(freed {total_memory_freed}MB total, cleanup: {final_before:.1f}% → {final_after:.1f}%)")
+        
+        return stored_count
+        
+        # 🚀 PROGRESSIVE STORAGE: Store and delete chunks to free memory immediately
         storage_batch_size = 1000  # Store 1000 chunks at once
         stored_count = 0
         
-        # Create concurrent storage tasks
-        storage_tasks = []
-        for i in range(0, total_chunks, storage_batch_size):
-            batch = all_chunks[i:i + storage_batch_size]
-            task = self.embedding_service.qdrant_service.store_embeddings(batch)
-            storage_tasks.append((i, len(batch), task))
+        # Process batches sequentially to enable immediate memory cleanup
+        logger.info(f"Processing {(total_chunks + storage_batch_size - 1) // storage_batch_size} storage batches with progressive memory cleanup...")
         
-        # Execute all storage tasks concurrently
-        logger.info(f"Executing {len(storage_tasks)} concurrent storage batches...")
-        results = await asyncio.gather(*[task for _, _, task in storage_tasks], return_exceptions=True)
-        
-        # Count successful storage
-        for (batch_idx, batch_size, _), result in zip(storage_tasks, results):
-            if isinstance(result, Exception):
-                logger.error(f"Storage batch {batch_idx//storage_batch_size + 1} failed: {str(result)}")
-            elif result:
-                stored_count += batch_size
-                logger.info(f"Storage batch {batch_idx//storage_batch_size + 1} succeeded: {batch_size} chunks")
-            else:
-                # Investigate why storage returned False
-                batch = all_chunks[batch_idx:batch_idx + storage_batch_size]
-                chunks_with_embeddings = sum(1 for chunk in batch if chunk.embedding is not None and len(chunk.embedding) > 0)
-                logger.error(f"Storage batch {batch_idx//storage_batch_size + 1} returned False: {chunks_with_embeddings}/{len(batch)} chunks had valid embeddings")
+        for batch_idx in range(0, total_chunks, storage_batch_size):
+            batch_end = min(batch_idx + storage_batch_size, total_chunks)
+            batch = all_chunks[batch_idx:batch_end]
+            batch_size = len(batch)
+            batch_num = batch_idx // storage_batch_size + 1
+            total_batches = (total_chunks + storage_batch_size - 1) // storage_batch_size
+            
+            logger.info(f"Storing batch {batch_num}/{total_batches}: {batch_size} chunks")
+            
+            try:
+                # Store the batch
+                result = await self.embedding_service.qdrant_service.store_embeddings(batch)
+                
+                if result:
+                    stored_count += batch_size
+                    logger.info(f"✅ Batch {batch_num} stored successfully: {batch_size} chunks")
+                    
+                    # 🚀 IMMEDIATE MEMORY CLEANUP: Clear the batch from memory
+                    for i in range(batch_idx, batch_end):
+                        if i < len(all_chunks):
+                            all_chunks[i] = None  # Clear reference
+                    
+                    # Force garbage collection every 5 batches to free memory
+                    if batch_num % 5 == 0:
+                        import gc
+                        before_cleanup = psutil.virtual_memory().percent
+                        gc.collect()
+                        after_cleanup = psutil.virtual_memory().percent
+                        logger.info(f"Memory cleanup after batch {batch_num}: {before_cleanup:.1f}% → {after_cleanup:.1f}%")
+                else:
+                    chunks_with_embeddings = sum(1 for chunk in batch if chunk.embedding is not None and len(chunk.embedding) > 0)
+                    logger.error(f"❌ Batch {batch_num} storage failed: {chunks_with_embeddings}/{batch_size} chunks had valid embeddings")
+                    
+            except Exception as e:
+                logger.error(f"❌ Batch {batch_num} failed with exception: {str(e)}")
         
         stage3_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
         logger.info(f"STAGE 3 COMPLETE: {stored_count}/{total_chunks} chunks stored, memory: {stage3_memory_mb}MB")
         
-        # 🚀 STAGE 4: Clear all memory
-        logger.info("STAGE 4: Clearing memory...")
+        # 🚀 STAGE 4: Final memory cleanup
+        logger.info("STAGE 4: Final memory cleanup...")
+        
+        # Clear the chunk list (most items are already None)
         del all_chunks
+        
+        # Force final garbage collection
         import gc
+        before_final = psutil.virtual_memory().percent
         gc.collect()
+        after_final = psutil.virtual_memory().percent
         
         final_memory_mb = psutil.virtual_memory().used // (1024 * 1024)
-        logger.info(f"STAGED PROCESSING COMPLETE: Memory cleared, now using {final_memory_mb}MB")
+        logger.info(f"STAGED PROCESSING COMPLETE: Final cleanup {before_final:.1f}% → {after_final:.1f}%, now using {final_memory_mb}MB")
         
         return stored_count
 

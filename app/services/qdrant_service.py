@@ -186,11 +186,19 @@ class QdrantService:
                 if chunk.embedding and len(chunk.embedding) > 0:
                     # Use a stable, unique ID for each point
                     point_id = str(uuid.uuid4())
+                    
+                    # Text should be available since we store before deleting
+                    chunk_text = chunk.text
+                    
+                    # DEBUG: Log embedding verification
+                    if i == 0:  # Log first chunk only
+                        logger.info(f"🔍 DEBUG: Storing chunk {i} - embedding sample: [{chunk.embedding[0]:.4f}, {chunk.embedding[1]:.4f}, ...] (length: {len(chunk.embedding)})")
+                    
                     point = PointStruct(
                         id=point_id,
-                        vector=chunk.embedding,
+                        vector=chunk.embedding,  # This is the actual embedding vector
                         payload={
-                            "text": chunk.text,
+                            "text": chunk_text,
                             "document_id": chunk.document_id,
                             "chunk_id": chunk.chunk_id,
                             "metadata": chunk.metadata or {}
