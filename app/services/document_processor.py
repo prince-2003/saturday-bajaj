@@ -1,446 +1,375 @@
 import asyncio
-import aiofiles
-import tempfile
+import io
 import os
-from typing import List, Dict, Any, Optional
+import re
+import time
+import hashlib
+from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple, Union
 from urllib.parse import urlparse
 import structlog
 import httpx
-from io import BytesIO
-import re # Import re at the top level
 
-import PyPDF2
-import pdfplumber
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
+
 from docx import Document
 import email
-from email.mime.text import MIMEText
 
-# Assuming settings and schemas are defined elsewhere correctly
 from app.core.config import settings
 from app.models.schemas import DocumentMetadata, EmbeddingChunk
 
-# Mock objects for stand-alone execution
-class MockSettings:
-    chunk_size = 512
 logger = structlog.get_logger(__name__)
 
-class DocumentProcessor:
-    """Handles document ingestion and processing for various file formats."""
 
-    def __init__(self):
-        self.chunk_size = settings.chunk_size
-        self.chunk_overlap = settings.chunk_overlap
+class OptimizedDocumentProcessor:
+    """
+    Production-ready Document Processor.
+    
+    Features:
+    - Single-pass PyMuPDF in-memory stream extraction (no disk churn)
+    - Deterministic SHA-256 byte-level document hashing
+    - Non-destructive paragraph chunking preserving legal clauses and table layouts
+    - Page-level metadata attribution for explainable retrieval
+    - Multi-format support (PDF, DOCX, Email, TXT)
+    """
+
+    def __init__(self, chunk_size: int = 1200, chunk_overlap: int = 200):
+        self.chunk_size = getattr(settings, "chunk_size", chunk_size) or 1200
+        self.chunk_overlap = getattr(settings, "chunk_overlap", chunk_overlap) or 200
+        self.batch_size = 150
         
-        # Cost-optimized chunking configuration
-        self.use_semantic_chunking = True
-        self.max_paragraph_chunk_size = getattr(settings, 'max_paragraph_chunk_size', self.chunk_size * 1.25)
-        self.min_chunk_size = getattr(settings, 'min_chunk_size', 100)
-        self.preserve_section_boundaries = True
-        
-        # Cost control settings
-        self.max_tokens_per_chunk = 800
-        self.enable_chunk_compression = True
+        logger.info("OptimizedDocumentProcessor initialized", 
+                    chunk_size=self.chunk_size, 
+                    chunk_overlap=self.chunk_overlap,
+                    pymupdf_available=fitz is not None)
+
+    def generate_document_id(self, content: Union[bytes, str]) -> str:
+        """
+        Deterministic SHA-256 hash of document content (or string fallback).
+        Ensures consistent cache hits regardless of expiring presigned URLs.
+        """
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        return hashlib.sha256(content).hexdigest()[:16]
+
+    # Backward compatibility alias
+    def _generate_document_id(self, source: Union[bytes, str]) -> str:
+        return self.generate_document_id(source)
+
+    def resolve_cloud_url(self, url: str) -> Tuple[str, Optional[str]]:
+        """
+        Transforms cloud storage sharing URLs (Google Drive, Docs, Dropbox, OneDrive)
+        into direct binary download endpoints.
+        Returns: (resolved_url, optional_file_id)
+        """
+        clean_url = url.strip()
+
+        # 1. Google Drive File URLs (/file/d/{id}/view, /open?id={id}, /uc?id={id})
+        drive_file_match = re.search(r"drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:[^&]*&)*id=)([a-zA-Z0-9_-]+)", clean_url)
+        if drive_file_match:
+            file_id = drive_file_match.group(1)
+            direct_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0"
+            return direct_url, file_id
+
+        # 2. Google Docs
+        docs_match = re.search(r"docs\.google\.com/document/d/([a-zA-Z0-9_-]+)", clean_url)
+        if docs_match:
+            doc_id = docs_match.group(1)
+            return f"https://docs.google.com/document/d/{doc_id}/export?format=pdf", doc_id
+
+        # 3. Google Sheets
+        sheets_match = re.search(r"docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_-]+)", clean_url)
+        if sheets_match:
+            sheet_id = sheets_match.group(1)
+            return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=pdf", sheet_id
+
+        # 4. Google Slides
+        slides_match = re.search(r"docs\.google\.com/presentation/d/([a-zA-Z0-9_-]+)", clean_url)
+        if slides_match:
+            slide_id = slides_match.group(1)
+            return f"https://docs.google.com/presentation/d/{slide_id}/export/pdf", slide_id
+
+        # 5. Dropbox share links
+        if "dropbox.com" in clean_url:
+            if "dl=0" in clean_url:
+                return clean_url.replace("dl=0", "dl=1"), None
+            elif "dl=1" not in clean_url:
+                sep = "&" if "?" in clean_url else "?"
+                return f"{clean_url}{sep}dl=1", None
+
+        return clean_url, None
 
     async def download_document(self, url: str) -> bytes:
-        """Download document from URL."""
+        """Download document from URL with timeout and automated cloud drive translation."""
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.get(url)
+            clean_url = url.strip()
+
+            # Handle Google Drive folder URLs: discover contained file(s)
+            if "drive.google.com" in clean_url and "folders" in clean_url:
+                logger.info("Detected Google Drive folder URL, scanning for files...", url=clean_url[:100])
+                async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+                    folder_resp = await client.get(clean_url)
+                    raw_ids = re.findall(r'ssk=\'[0-9]+:[^:]+:([a-zA-Z0-9_-]{25,50})', folder_resp.text)
+                    cleaned_ids = []
+                    for rid in raw_ids:
+                        base_id = re.sub(r'-\d+(-\d+)*$', '', rid)
+                        if len(base_id) >= 25 and base_id not in cleaned_ids:
+                            cleaned_ids.append(base_id)
+                    if cleaned_ids:
+                        target_id = cleaned_ids[0]
+                        logger.info("Found file inside Google Drive folder", file_id=target_id)
+                        clean_url = f"https://drive.google.com/file/d/{target_id}/view"
+
+            download_url, file_id = self.resolve_cloud_url(clean_url)
+            logger.info("Downloading document", original_url=url[:100], download_url=download_url[:100])
+
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                response = await client.get(download_url)
                 response.raise_for_status()
-                return response.content
+                content = response.content
+
+                # Check for Google Drive virus scan warning / confirm token
+                if b"confirm=" in content:
+                    confirm_match = re.search(r'confirm=([0-9A-Za-z_]+)', response.text)
+                    if confirm_match:
+                        confirm_token = confirm_match.group(1)
+                        second_url = f"{download_url}&confirm={confirm_token}"
+                        logger.info("Bypassing Google Drive virus scan confirmation", confirm_token=confirm_token)
+                        response = await client.get(second_url)
+                        response.raise_for_status()
+                        content = response.content
+
+                # If Google Drive returned an HTML preview wrapper instead of binary, retry fallback
+                if file_id and (content.lstrip().startswith(b"<!DOCTYPE") or content.lstrip().startswith(b"<html")):
+                    alt_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+                    logger.info("Google Drive returned HTML preview, retrying with uc export endpoint", alt_url=alt_url)
+                    alt_resp = await client.get(alt_url)
+                    if alt_resp.is_success and not alt_resp.content.lstrip().startswith(b"<!DOCTYPE"):
+                        content = alt_resp.content
+
+                logger.info("Document downloaded successfully", size_bytes=len(content), is_pdf=content.lstrip().startswith(b"%PDF"))
+                return content
         except Exception as e:
             logger.error("Failed to download document", url=url, error=str(e))
             raise ValueError(f"Failed to download document: {str(e)}")
 
-    async def process_document(self, url: str) -> tuple[DocumentMetadata, List[EmbeddingChunk]]:
-        """Process document from URL and return metadata and chunks."""
-        logger.info("Processing document", url=url)
-        
-        # Download document
-        document_content = await self.download_document(url)
-        
-        # Determine file type from URL
-        parsed_url = urlparse(url)
-        file_extension = os.path.splitext(parsed_url.path)[1].lower()
-        
-        if not file_extension:
-            # Try to determine from content type or content
-            if document_content.startswith(b'%PDF'):
-                file_extension = '.pdf'
-            elif document_content.startswith(b'PK'):
-                file_extension = '.docx'
-            else:
-                file_extension = '.txt'
-        
-        with tempfile.NamedTemporaryFile(suffix=file_extension, delete=False) as temp_file:
-            temp_file.write(document_content)
-            temp_file_path = temp_file.name
-        
-        try:
-            if file_extension == '.pdf':
-                text_content, total_pages = await self._process_pdf(temp_file_path)
-            elif file_extension == '.docx':
-                text_content, total_pages = await self._process_docx(temp_file_path)
-            elif file_extension in ['.eml', '.msg']:
-                text_content, total_pages = await self._process_email(temp_file_path)
-            else:
-                async with aiofiles.open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    text_content = await f.read()
-                total_pages = None
-            
-            chunks = self._create_chunks(text_content, url)
-            
-            document_id = self._generate_document_id(url)
-            metadata = DocumentMetadata(
-                document_id=document_id,
-                document_type=file_extension[1:],
-                total_pages=total_pages,
-                total_chunks=len(chunks),
-                processing_time=0.0
-            )
-            
-            logger.info("Document processed successfully", 
-                        document_id=document_id, 
-                        chunks=len(chunks), 
-                        pages=total_pages)
-            
-            return metadata, chunks
-            
-        finally:
-            os.unlink(temp_file_path)
-
-    async def _process_pdf(self, file_path: str) -> tuple[str, int]:
-        """Process PDF file and extract text."""
-        text_content = ""
-        total_pages = 0
-        
-        try:
-            with pdfplumber.open(file_path) as pdf:
-                total_pages = len(pdf.pages)
-                for page_num, page in enumerate(pdf.pages):
-                    page_text = page.extract_text()
-                    if page_text:
-                        text_content += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
-        except Exception as e:
-            logger.warning("pdfplumber failed, trying PyPDF2", error=str(e))
+    def extract_text_from_pdf(self, content: bytes) -> Tuple[str, int]:
+        """
+        Single-pass in-memory PDF extraction using PyMuPDF (fitz) without disk churn.
+        Falls back to pdfplumber or PyPDF2 if PyMuPDF is not available or encounters errors.
+        """
+        if fitz:
             try:
-                with open(file_path, 'rb') as file:
-                    pdf_reader = PyPDF2.PdfReader(file)
-                    total_pages = len(pdf_reader.pages)
-                    for page_num, page in enumerate(pdf_reader.pages):
-                        page_text = page.extract_text()
-                        if page_text:
-                            text_content += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
-            except Exception as e2:
-                logger.error("Both PDF processors failed", error=str(e2))
-                raise ValueError(f"Failed to process PDF: {str(e2)}")
-        
-        return text_content.strip(), total_pages
-    
-    async def _process_docx(self, file_path: str) -> tuple[str, Optional[int]]:
-        """Process DOCX file and extract text."""
-        try:
-            doc = Document(file_path)
-            text_content = ""
-            
-            for paragraph in doc.paragraphs:
-                if paragraph.text.strip():
-                    text_content += paragraph.text + "\n"
-            
-            for table in doc.tables:
-                for row in table.rows:
-                    row_text = " | ".join([cell.text.strip() for cell in row.cells])
-                    if row_text.strip():
-                        text_content += row_text + "\n"
-            
-            return text_content.strip(), None
-            
-        except Exception as e:
-            logger.error("Failed to process DOCX", error=str(e))
-            raise ValueError(f"Failed to process DOCX: {str(e)}")
-    
-    async def _process_email(self, file_path: str) -> tuple[str, Optional[int]]:
-        """Process email file and extract text."""
-        try:
-            with open(file_path, 'rb') as f:
-                msg = email.message_from_bytes(f.read())
-            
-            text_content = ""
-            
-            text_content += f"From: {msg.get('From', 'Unknown')}\n"
-            text_content += f"To: {msg.get('To', 'Unknown')}\n"
-            text_content += f"Subject: {msg.get('Subject', 'No Subject')}\n"
-            text_content += f"Date: {msg.get('Date', 'Unknown')}\n\n"
-            
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        text_content += part.get_payload(decode=True).decode('utf-8', errors='ignore')
-            else:
-                text_content += msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-            
-            return text_content.strip(), None
-            
-        except Exception as e:
-            logger.error("Failed to process email", error=str(e))
-            raise ValueError(f"Failed to process email: {str(e)}")
+                doc = fitz.open(stream=content, filetype="pdf")
+                total_pages = len(doc)
+                pages_text = []
+                for page_idx in range(total_pages):
+                    page = doc[page_idx]
+                    text = page.get_text("text").strip()
+                    if text:
+                        pages_text.append(f"--- Page {page_idx + 1} ---\n{text}")
+                doc.close()
+                return "\n\n".join(pages_text), total_pages
+            except Exception as e:
+                logger.warning("PyMuPDF stream extraction failed, trying fallbacks", error=str(e))
 
-    def _create_chunks(self, text: str, document_url: str) -> List[EmbeddingChunk]:
-        """Create chunks from text content using cost-optimized paragraph-based strategy."""
-        chunks = []
-        document_id = self._generate_document_id(document_url)
-        chunk_index = 0
-        
-        paragraphs = self._split_into_paragraphs(text)
-        
-        current_chunk = ""
-        current_chunk_paragraphs = []
-        
-        for paragraph in paragraphs:
-            paragraph = paragraph.strip()
-            if not paragraph:
-                continue
-                
-            # Compress paragraph if enabled
-            if self.enable_chunk_compression:
-                # Call the new smarter compression method
-                paragraph = self._compress_text(paragraph)
-            
-            para_token_count = len(paragraph.split()) * 0.75
-            current_token_count = len(current_chunk.split()) * 0.75
-            
-            if current_token_count > 0 and (
-                current_token_count + para_token_count > self.max_tokens_per_chunk or
-                len(current_chunk.split()) + len(paragraph.split()) > self.max_paragraph_chunk_size
-            ):
-                if current_chunk.strip() and len(current_chunk.split()) >= self.min_chunk_size:
-                    chunk = self._create_chunk(
-                        current_chunk.strip(), 
-                        document_id, 
-                        chunk_index, 
-                        document_url
-                    )
-                    chunks.append(chunk)
-                    chunk_index += 1
-                
-                if self.chunk_overlap > 0 and current_chunk_paragraphs:
-                    overlap_context = self._get_overlap_context(current_chunk_paragraphs[-1])
-                    current_chunk = overlap_context + "\n\n" + paragraph if overlap_context else paragraph
-                else:
-                    current_chunk = paragraph
-                current_chunk_paragraphs = [paragraph]
-            else:
-                if current_chunk:
-                    current_chunk += "\n\n" + paragraph
-                else:
-                    current_chunk = paragraph
-                current_chunk_paragraphs.append(paragraph)
-        
-        if current_chunk.strip() and len(current_chunk.split()) >= self.min_chunk_size:
-            chunk = self._create_chunk(
-                current_chunk.strip(), 
-                document_id, 
-                chunk_index, 
-                document_url
-            )
-            chunks.append(chunk)
-        
-        total_tokens = sum(len(chunk.text.split()) * 0.75 for chunk in chunks)
-        avg_tokens_per_chunk = total_tokens / len(chunks) if chunks else 0
-        
-        logger.info("Created cost-optimized chunks", 
-                    total_chunks=len(chunks),
-                    estimated_total_tokens=int(total_tokens),
-                    avg_tokens_per_chunk=int(avg_tokens_per_chunk),
-                    max_tokens_per_chunk=max(len(chunk.text.split()) * 0.75 for chunk in chunks) if chunks else 0)
-        
-        return chunks
+        # Fallback 1: pdfplumber in-memory
+        if pdfplumber:
+            try:
+                with pdfplumber.open(io.BytesIO(content)) as pdf:
+                    total_pages = len(pdf.pages)
+                    pages_text = []
+                    for page_idx, page in enumerate(pdf.pages):
+                        text = page.extract_text() or ""
+                        if text.strip():
+                            pages_text.append(f"--- Page {page_idx + 1} ---\n{text.strip()}")
+                    return "\n\n".join(pages_text), total_pages
+            except Exception as e:
+                logger.warning("pdfplumber fallback failed", error=str(e))
 
-    def _compress_text(self, text: str) -> str:
+        # Fallback 2: PyPDF2 in-memory
+        if PyPDF2:
+            try:
+                reader = PyPDF2.PdfReader(io.BytesIO(content))
+                total_pages = len(reader.pages)
+                pages_text = []
+                for page_idx in range(total_pages):
+                    text = reader.pages[page_idx].extract_text() or ""
+                    if text.strip():
+                        pages_text.append(f"--- Page {page_idx + 1} ---\n{text.strip()}")
+                return "\n\n".join(pages_text), total_pages
+            except Exception as e:
+                logger.error("PyPDF2 fallback failed", error=str(e))
+
+        raise ValueError("All PDF extraction libraries failed or are not installed.")
+
+    def extract_text_from_docx(self, content: bytes) -> Tuple[str, Optional[int]]:
+        """Extract text and tables from DOCX in-memory."""
+        doc = Document(io.BytesIO(content))
+        elements = []
+        for p in doc.paragraphs:
+            if p.text.strip():
+                elements.append(p.text.strip())
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    elements.append(row_text)
+        return "\n\n".join(elements), None
+
+    def extract_text_from_email(self, content: bytes) -> Tuple[str, Optional[int]]:
+        """Extract text from Email in-memory."""
+        msg = email.message_from_bytes(content)
+        body = []
+        for header in ["From", "To", "Subject", "Date"]:
+            if msg.get(header):
+                body.append(f"{header}: {msg.get(header)}")
+        body.append("")
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        body.append(payload.decode("utf-8", errors="ignore"))
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                body.append(payload.decode("utf-8", errors="ignore"))
+        return "\n\n".join(body), None
+
+    def create_chunks(self, text: str, document_id: str) -> List[EmbeddingChunk]:
         """
-        Compresses text by replacing long, redundant phrases with shorter equivalents,
-        significantly reducing token count while preserving meaning.
+        Structure-preserving paragraph-based chunking with page number attribution.
+        Avoids lossy regex compression to maintain legal numbers, clause headers, and tables.
         """
-        # A dictionary mapping long phrases (as regex) to their shorter replacements.
-        # This is more powerful than just removing text.
-        replacement_map = {
-            # General Legal & Insurance Phrases
-            r'\bwhich shall be the basis of this contract and is deemed to be incorporated herein\b': '[part of contract]',
-            r'\bfollowing the Medical Advice of a duly qualified Medical Practitioner\b': 'on a doctor\'s advice',
-            r'\bThe Company shall indemnify the Hospital or the Insured, Reasonable and Customary Charges incurred for Medically Necessary Treatment\b': 'Company will pay for approved medical costs',
-            r'\bThe Company shall not be liable to make any payment by the Policy, in respect of any expenses incurred in connection with or in respect of\b': 'Policy excludes payment for',
-            r'\bsubject to the Definitions, Terms, Exclusions, Conditions contained herein and limits\b': 'subject to policy terms and limits',
-            r'\bhas applied to National Insurance Company Ltd\. \(hereinafter called the Company\)\b': 'has applied to the Company',
-            r'\bsudden, unforeseen and involuntary event caused by external, visible and violent means\b': '[definition of Accident]',
-            r'\bunder the supervision of a registered and qualified medical practitioner\b': 'under a qualified doctor\'s supervision',
-            r'\b(shall be|are) accessible to the insurance company\'s authorized representative\b': 'accessible to the insurer',
-            
-            # Specific recurring clauses
-            r'\bIn the event of hospitalisation/ domiciliary hospitalisation, the insured person/insured person\'s representative shall notify\b': 'For hospitalization, insured must notify',
-            r'\b(for|under) any of the following circumstances\b': 'if:',
-            r'\bThe services offered by a TPA shall not include\b': 'TPA services exclude:',
-            r'\bThe policy shall be void and all premium paid thereon shall be forfeited to the Company\b': 'Policy will be voided',
-            r'\bin the event of misrepresentation, mis description or non-disclosure of any material fact\b': 'for any non-disclosure',
+        raw_paragraphs = text.split("\n\n")
+        chunks: List[EmbeddingChunk] = []
+        current_chunk_parts: List[str] = []
+        current_length = 0
+        current_page = 1
 
-            # Repeated Header/Footer info (can be removed entirely)
-            r'National Insurance Co\. Ltd\.': '',
-            r'Premises No\. 18-0374, Plot no\. CBD-81, New Town, Kolkata - 700156': '',
-            r'National Parivar Mediclaim Plus Policy': '',
-            r'UIN: NICHLIP25039V032425': '',
-            r'Page \d+ of \d+': ''
-        }
-        
-        # Apply all replacements
-        for pattern, replacement in replacement_map.items():
-            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-            
-        # Final cleanup of excessive whitespace
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        return text
+        def extract_page_num(s: str) -> Optional[int]:
+            m = re.search(r"---\s*Page\s+(\d+)\s*---", s)
+            return int(m.group(1)) if m else None
 
-    def _get_overlap_context(self, paragraph: str) -> str:
-        """Get smart overlap context - last sentence instead of full paragraph."""
-        sentences = paragraph.split('.')
-        if len(sentences) > 1:
-            return sentences[-2].strip() + '.' if sentences[-2].strip() else ''
-        return paragraph[:100] + '...' if len(paragraph) > 100 else paragraph
-
-    def _split_into_paragraphs(self, text: str) -> List[str]:
-        """Split text into meaningful paragraphs with enhanced logic."""
-        paragraphs = text.split('\n\n')
-        
-        refined_paragraphs = []
-        
-        for para in paragraphs:
+        for para in raw_paragraphs:
             para = para.strip()
             if not para:
                 continue
-                
-            if len(para.split()) > self.chunk_size * 2:
-                sentences = self._split_into_sentences(para)
-                current_para = ""
-                
-                for sentence in sentences:
-                    if not current_para:
-                        current_para = sentence
-                    elif len((current_para + " " + sentence).split()) <= self.chunk_size * 2:
-                        current_para += " " + sentence
-                    else:
-                        refined_paragraphs.append(current_para)
-                        current_para = sentence
-                
-                if current_para:
-                    refined_paragraphs.append(current_para)
+
+            page_match = extract_page_num(para)
+            if page_match:
+                current_page = page_match
+
+            para_len = len(para)
+            if current_length + para_len > self.chunk_size and current_chunk_parts:
+                chunk_body = "\n\n".join(current_chunk_parts)
+                chunk_idx = len(chunks)
+                chunks.append(
+                    EmbeddingChunk(
+                        chunk_id=f"{document_id}_{chunk_idx}",
+                        document_id=document_id,
+                        text=chunk_body,
+                        chunk_index=chunk_idx,
+                        metadata={"page_number": current_page}
+                    )
+                )
+
+                # Overlap: keep trailing paragraph if overlap enabled
+                if self.chunk_overlap > 0 and len(current_chunk_parts) > 1:
+                    last_para = current_chunk_parts[-1]
+                    current_chunk_parts = [last_para, para]
+                    current_length = len(last_para) + para_len
+                else:
+                    current_chunk_parts = [para]
+                    current_length = para_len
             else:
-                refined_paragraphs.append(para)
-        
-        return refined_paragraphs
-    
-    def _split_into_sentences(self, text: str) -> List[str]:
-        """Split text into sentences with improved logic."""
-        sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z])|(?<=[.!?])\s*\n+\s*(?=[A-Z])'
-        sentences = re.split(sentence_pattern, text)
-        
-        cleaned_sentences = []
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if sentence and len(sentence.split()) >= 3:
-                cleaned_sentences.append(sentence)
-        
-        return cleaned_sentences
-    
-    def _create_chunk(self, text: str, document_id: str, chunk_index: int, document_url: str) -> EmbeddingChunk:
-        """Create a single embedding chunk with metadata."""
-        return EmbeddingChunk(
-            chunk_id=f"{document_id}_chunk_{chunk_index}",
+                current_chunk_parts.append(para)
+                current_length += para_len
+
+        if current_chunk_parts:
+            chunk_body = "\n\n".join(current_chunk_parts)
+            chunk_idx = len(chunks)
+            chunks.append(
+                EmbeddingChunk(
+                    chunk_id=f"{document_id}_{chunk_idx}",
+                    document_id=document_id,
+                    text=chunk_body,
+                    chunk_index=chunk_idx,
+                    metadata={"page_number": current_page}
+                )
+            )
+
+        logger.info("Chunking completed", document_id=document_id, total_chunks=len(chunks))
+        return chunks
+
+    # Alias for backward compatibility
+    def _create_chunks(self, text: str, document_url: str) -> List[EmbeddingChunk]:
+        doc_id = self.generate_document_id(document_url.encode("utf-8"))
+        return self.create_chunks(text, doc_id)
+
+    async def process_document(self, url: str) -> Tuple[DocumentMetadata, List[EmbeddingChunk]]:
+        """Process document into DocumentMetadata and list of EmbeddingChunks."""
+        start_time = time.time()
+        content = await self.download_document(url)
+        document_id = self.generate_document_id(content)
+
+        parsed_url = urlparse(url)
+        ext = os.path.splitext(parsed_url.path)[1].lower()
+        stripped = content.lstrip()
+        if stripped.startswith(b"%PDF"):
+            ext = ".pdf"
+        elif stripped.startswith(b"PK"):
+            ext = ".docx"
+        elif not ext:
+            ext = ".txt"
+
+        if ext == ".pdf":
+            text_content, pages = self.extract_text_from_pdf(content)
+        elif ext == ".docx":
+            text_content, pages = self.extract_text_from_docx(content)
+        elif ext in [".eml", ".msg"]:
+            text_content, pages = self.extract_text_from_email(content)
+        else:
+            text_content = content.decode("utf-8", errors="ignore")
+            pages = None
+
+        chunks = self.create_chunks(text_content, document_id)
+        metadata = DocumentMetadata(
             document_id=document_id,
-            text=text,
-            chunk_index=chunk_index,
-            metadata={
-                "page_number": self._extract_page_number(text),
-                "section": self._extract_section(text),
-                "clause_type": self._classify_clause_type(text),
-                "document_url": document_url
-            }
+            filename=os.path.basename(parsed_url.path) or "document",
+            size_bytes=len(content),
+            pages=pages,
+            processing_time=time.time() - start_time,
+            chunks_created=len(chunks)
         )
-    
-    def _generate_document_id(self, url: str) -> str:
-        """Generate a unique document ID from URL."""
-        import hashlib
-        return hashlib.md5(url.encode()).hexdigest()[:12]
-    
-    def _extract_page_number(self, text: str) -> Optional[int]:
-        """Extract page number from chunk text."""
-        page_match = re.search(r'--- Page (\d+) ---', text)
-        if page_match:
-            return int(page_match.group(1))
-        return None
-    
-    def _extract_section(self, text: str) -> Optional[str]:
-        """Extract section information from chunk text with enhanced logic."""
-        lines = text.split('\n')
-        
-        for line in lines[:5]:
-            line = line.strip()
-            if not line:
-                continue
-                
-            section_patterns = [
-                r'^(SECTION|Section)\s+[IVX\d]+[\.\:\-\s]*(.+)',
-                r'^(ARTICLE|Article)\s+[IVX\d]+[\.\:\-\s]*(.+)',
-                r'^(CLAUSE|Clause)\s+[IVX\d]+[\.\:\-\s]*(.+)',
-                r'^(CHAPTER|Chapter)\s+[IVX\d]+[\.\:\-\s]*(.+)',
-                r'^([IVX\d]+[\.\)]\s*.{5,50})',
-                r'^([A-Z][A-Z\s]{10,50}):',
-            ]
-            
-            for pattern in section_patterns:
-                match = re.search(pattern, line, re.IGNORECASE)
-                if match:
-                    return match.group(0).strip()
-        
-        insurance_sections = [
-            'coverage', 'benefits', 'exclusions', 'limitations', 'definitions',
-            'waiting period', 'grace period', 'claims', 'premium', 'renewal',
-            'policy terms', 'conditions', 'procedures', 'eligibility'
-        ]
-        
-        text_lower = text.lower()
-        for section in insurance_sections:
-            if section in text_lower:
-                for line in lines[:3]:
-                    if section in line.lower():
-                        return line.strip()
-                        
-        return None
-    
-    def _classify_clause_type(self, text: str) -> Optional[str]:
-        """Classify the type of clause based on content with enhanced patterns."""
-        text_lower = text.lower()
-        
-        classification_patterns = {
-            'coverage_clause': ['cover', 'benefit', 'include', 'eligible', 'entitle', 'reimburse', 'payable', 'treatment covered', 'medical expenses', 'hospital benefit'],
-            'exclusion_clause': ['exclude', 'not cover', 'limitation', 'restrict', 'prohibit', 'except', 'does not include', 'not eligible', 'not payable'],
-            'condition_clause': ['condition', 'require', 'must', 'shall', 'obligation', 'duty', 'responsibility', 'comply', 'fulfill', 'subject to'],
-            'payment_clause': ['premium', 'payment', 'cost', 'fee', 'charge', 'amount', 'installment', 'due', 'payable', 'billing'],
-            'time_clause': ['waiting period', 'grace period', 'time', 'duration', 'deadline', 'within', 'before', 'after', 'days', 'months', 'years'],
-            'claims_clause': ['claim', 'settlement', 'procedure', 'process', 'submit', 'documentation', 'proof', 'evidence', 'notification'],
-            'definitions_clause': ['means', 'defined as', 'definition', 'interpret', 'refer to', 'shall mean', 'is defined', 'for the purpose'],
-            'renewal_clause': ['renewal', 'renew', 'extend', 'continuation', 'expiry', 'terminate', 'cancellation', 'policy period']
-        }
-        
-        category_scores = {}
-        for category, keywords in classification_patterns.items():
-            score = 0
-            for keyword in keywords:
-                if keyword in text_lower:
-                    score += len(keyword.split())
-            category_scores[category] = score
-        
-        if category_scores:
-            best_category = max(category_scores, key=category_scores.get)
-            if category_scores[best_category] > 0:
-                return best_category
-        
-        return 'general_clause'
+        return metadata, chunks
+
+    async def process_document_streaming(
+        self, url: str
+    ) -> Tuple[DocumentMetadata, AsyncGenerator[List[EmbeddingChunk], None]]:
+        """Streaming generator interface yielding batches of EmbeddingChunk."""
+        metadata, all_chunks = await self.process_document(url)
+
+        async def chunk_generator():
+            batch_size = self.batch_size
+            for i in range(0, len(all_chunks), batch_size):
+                yield all_chunks[i:i + batch_size]
+
+        return metadata, chunk_generator()
+
+
+# Compatibility alias
+DocumentProcessor = OptimizedDocumentProcessor

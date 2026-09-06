@@ -16,16 +16,30 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4-turbo"
     openai_embedding_model: str = "text-embedding-3-large"
-    max_tokens: int = 1500  # Reduced for faster responses
+    max_tokens: int = 4000  # Increased for testing - was 1500
     temperature: float = 0.1
     
     # Anthropic Configuration (Primary LLM)
     anthropic_api_key: Optional[str] = None
     anthropic_model: str = "claude-3-haiku-20240307"
-    anthropic_max_tokens: int = 1000
+    anthropic_max_tokens: int = 3000  # Increased for testing - was 1000
+    
+    # Google Gemini Configuration (New Primary LLM)
+    google_api_key: Optional[str] = None
+    gemini_model: str = "gemini-3.6-flash"
+    gemini_max_tokens: int = 8192
+    
+    # Timeout Configuration
+    client_timeout: int = 300  # 5 minutes max for client requests
+    llm_timeout: int = 30      # 30 seconds per LLM call
+    embedding_timeout: int = 60 # 1 minute for embedding generation
+    document_processing_timeout: int = 180  # 3 minutes for document processing
     
     # Embedding Configuration
-    embedding_dimension: int = 1536  # OpenAI embedding dimension
+    use_local_embeddings: bool = True
+    fastembed_model: str = "BAAI/bge-small-en-v1.5"
+    fastembed_sparse_model: str = "Qdrant/bm25"
+    embedding_dimension: int = 384  # BAAI/bge-small-en-v1.5 dimension (was 3072 for OpenAI large)
     
     # Qdrant Configuration (Primary Vector DB)
     qdrant_url: Optional[str] = None
@@ -71,6 +85,12 @@ class Settings(BaseSettings):
     simple_question_threshold: float = 0.3  # Complexity threshold
     use_fast_model_first: bool = True
     fallback_to_gpt4: bool = True
+    
+    # Rate Limiting Settings
+    openai_requests_per_minute: int = 3000
+    anthropic_requests_per_minute: int = 1000
+    base_retry_delay: float = 1.0
+    max_retries: int = 3
     
     # Memory Management
     max_memory_cache_size: int = 1000  # Number of items
