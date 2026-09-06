@@ -3,7 +3,11 @@ import uuid # Import uuid
 from typing import List, Dict, Any, Optional
 import structlog
 from qdrant_client import AsyncQdrantClient, QdrantClient # Import AsyncQdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, ScoredPoint, PayloadSchemaType
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, Filter, FieldCondition, 
+    MatchValue, ScoredPoint, PayloadSchemaType,
+    SparseVectorParams, SparseVector, Prefetch, FusionQuery, Fusion
+)
 
 from app.core.config import settings
 from app.models.schemas import EmbeddingChunk
@@ -62,37 +66,50 @@ class QdrantService:
             existing_collections = [col.name for col in collections_response.collections]
             
             if collection_name not in existing_collections:
-                # Step 1: Create the collection
+                # Step 1: Create the collection with dual named vectors (dense + sparse)
                 await self.client.create_collection(
                     collection_name=collection_name,
-                    vectors_config=VectorParams(
-                        size=settings.embedding_dimension,
-                        distance=Distance.COSINE
-                    )
+                    vectors_config={
+                        "dense": VectorParams(
+                            size=settings.embedding_dimension,
+                            distance=Distance.COSINE
+                        )
+                    },
+                    sparse_vectors_config={
+                        "sparse": SparseVectorParams()
+                    }
                 )
-                logger.info("Created Qdrant collection", collection=collection_name, dimension=settings.embedding_dimension)
+                logger.info("Created Qdrant hybrid collection", collection=collection_name, dimension=settings.embedding_dimension)
                 
                 # Step 2: IMMEDIATELY create the necessary index after creating the collection
                 logger.info("Creating payload index for 'document_id' on new collection.")
                 await self.create_payload_index(collection_name, "document_id", "keyword")
             else:
-                # Validate vector dimension matches settings.embedding_dimension
+                # Validate vector configuration matches hybrid setup
                 try:
                     info = await self.client.get_collection(collection_name=collection_name)
                     vectors_conf = info.config.params.vectors
-                    curr_size = None
-                    if hasattr(vectors_conf, "size"):
-                        curr_size = vectors_conf.size
-                    elif isinstance(vectors_conf, dict) and "" in vectors_conf:
-                        curr_size = vectors_conf[""].size
+                    sparse_conf = getattr(info.config.params, "sparse_vectors", None)
 
-                    if curr_size and curr_size != settings.embedding_dimension:
-                        logger.warning("Qdrant collection dimension mismatch, auto-migrating...", 
-                                       current_size=curr_size, 
-                                       expected_size=settings.embedding_dimension)
+                    needs_migration = False
+                    # Check dense vector
+                    if isinstance(vectors_conf, dict):
+                        if "dense" not in vectors_conf or vectors_conf["dense"].size != settings.embedding_dimension:
+                            needs_migration = True
+                    else:
+                        # Old unnamed single vector
+                        needs_migration = True
+
+                    # Check sparse vector
+                    if not sparse_conf or (isinstance(sparse_conf, dict) and "sparse" not in sparse_conf):
+                        needs_migration = True
+
+                    if needs_migration:
+                        logger.warning("Qdrant collection configuration mismatch (hybrid vectors missing or wrong dimension), auto-migrating...", 
+                                       collection=collection_name)
                         return await self.recreate_collection_with_correct_dimensions(collection_name)
                 except Exception as dim_err:
-                    logger.warning("Could not verify existing collection dimension", error=str(dim_err))
+                    logger.warning("Could not verify existing collection configuration", error=str(dim_err))
 
             return True
             
@@ -111,8 +128,8 @@ class QdrantService:
         try:
             collections_response = await self.client.get_collections()
             existing_collections = [col.name for col in collections_response.collections]
-            exists = collection_name in existing_collections
             
+            exists = collection_name in existing_collections
             logger.debug("Collection existence check", 
                         collection=collection_name, 
                         exists=exists)
@@ -125,7 +142,7 @@ class QdrantService:
             return False
 
     async def recreate_collection_with_correct_dimensions(self, collection_name: str = None) -> bool:
-        """Recreate collection with correct embedding dimensions (3072 for text-embedding-3-large)."""
+        """Recreate collection with hybrid vector configuration (dense 384d + sparse BM25)."""
         if not self.client:
             logger.error("Qdrant client not initialized")
             return False
@@ -138,18 +155,23 @@ class QdrantService:
             existing_collections = [col.name for col in collections_response.collections]
             
             if collection_name in existing_collections:
-                logger.info("Deleting existing collection with wrong dimensions", collection=collection_name)
+                logger.info("Deleting existing collection for hybrid migration", collection=collection_name)
                 await self.client.delete_collection(collection_name=collection_name)
             
-            # Create new collection with correct dimensions
+            # Create new collection with dual vectors: dense and sparse
             await self.client.create_collection(
                 collection_name=collection_name,
-                vectors_config=VectorParams(
-                    size=settings.embedding_dimension,  # Should now be 3072
-                    distance=Distance.COSINE
-                )
+                vectors_config={
+                    "dense": VectorParams(
+                        size=settings.embedding_dimension,
+                        distance=Distance.COSINE
+                    )
+                },
+                sparse_vectors_config={
+                    "sparse": SparseVectorParams()
+                }
             )
-            logger.info("Recreated Qdrant collection with correct dimensions", 
+            logger.info("Recreated Qdrant collection with hybrid schema", 
                        collection=collection_name, 
                        dimension=settings.embedding_dimension)
             
@@ -163,7 +185,7 @@ class QdrantService:
             return False
 
     async def store_embeddings(self, chunks: List[EmbeddingChunk], collection_name: str = None) -> bool:
-        """Store embeddings in Qdrant with batch splitting and retry logic."""
+        """Store hybrid embeddings (dense + sparse) in Qdrant with batch splitting and retry logic."""
         if not self.client:
             logger.error("Qdrant client not initialized")
             return False
@@ -171,53 +193,28 @@ class QdrantService:
         collection_name = collection_name or settings.qdrant_collection_name
         
         try:
-            # Check if collection exists and has correct dimensions
-            collections_response = await self.client.get_collections()
-            existing_collections = [col.name for col in collections_response.collections]
-            
-            if collection_name in existing_collections:
-                # Check collection info to verify dimensions
-                collection_info = await self.client.get_collection(collection_name)
-                current_dimension = collection_info.config.params.vectors.size
-                expected_dimension = settings.embedding_dimension
-                
-                if current_dimension != expected_dimension:
-                    logger.warning("Collection dimension mismatch", 
-                                 current=current_dimension, 
-                                 expected=expected_dimension,
-                                 collection=collection_name)
-                    # Recreate collection with correct dimensions
-                    await self.recreate_collection_with_correct_dimensions(collection_name)
-                else:
-                    logger.info("Collection dimensions correct", dimension=current_dimension)
-            else:
-                # Create new collection
-                await self.create_collection(collection_name)
+            # Ensure collection exists and conforms to hybrid schema
+            await self.create_collection(collection_name)
             
             # Convert chunks to points
             points = []
             for i, chunk in enumerate(chunks):
-                logger.debug("Processing chunk for storage", 
-                           chunk_index=i, 
-                           chunk_id=getattr(chunk, 'chunk_id', 'unknown'),
-                           has_embedding=hasattr(chunk, 'embedding') and chunk.embedding is not None,
-                           embedding_length=len(chunk.embedding) if hasattr(chunk, 'embedding') and chunk.embedding else 0,
-                           has_metadata=hasattr(chunk, 'metadata'))
-                
                 if chunk.embedding and len(chunk.embedding) > 0:
-                    # Use a stable, unique ID for each point
                     point_id = str(uuid.uuid4())
-                    
-                    # Text should be available since we store before deleting
                     chunk_text = chunk.text
                     
-                    # DEBUG: Log embedding verification
-                    if i == 0:  # Log first chunk only
-                        logger.info(f"🔍 DEBUG: Storing chunk {i} - embedding sample: [{chunk.embedding[0]:.4f}, {chunk.embedding[1]:.4f}, ...] (length: {len(chunk.embedding)})")
+                    vector_data: Dict[str, Any] = {
+                        "dense": chunk.embedding
+                    }
+                    if chunk.sparse_indices is not None and chunk.sparse_values is not None and len(chunk.sparse_indices) > 0:
+                        vector_data["sparse"] = SparseVector(
+                            indices=chunk.sparse_indices,
+                            values=chunk.sparse_values
+                        )
                     
                     point = PointStruct(
                         id=point_id,
-                        vector=chunk.embedding,  # This is the actual embedding vector
+                        vector=vector_data,
                         payload={
                             "text": chunk_text,
                             "document_id": chunk.document_id,
@@ -226,20 +223,15 @@ class QdrantService:
                         }
                     )
                     points.append(point)
-                    logger.debug("Created point for chunk", point_id=point_id, chunk_id=chunk.chunk_id)
                 else:
-                    logger.warning("Chunk has no valid embedding", 
-                                 chunk_id=getattr(chunk, 'chunk_id', 'unknown'),
-                                 embedding_status=f"embedding={'None' if not hasattr(chunk, 'embedding') else 'empty' if not chunk.embedding else 'length=' + str(len(chunk.embedding))}")
+                    logger.warning("Chunk has no valid embedding", chunk_id=getattr(chunk, 'chunk_id', 'unknown'))
 
             if not points:
-                logger.error("No valid embeddings to store", 
-                           total_chunks=len(chunks),
-                           chunks_without_embeddings=sum(1 for c in chunks if not hasattr(c, 'embedding') or not c.embedding or len(c.embedding) == 0))
+                logger.error("No valid embeddings to store", total_chunks=len(chunks))
                 return False
 
             # Split large batches into smaller ones for better reliability
-            max_batch_size = 100  # Qdrant handles smaller batches better
+            max_batch_size = 100
             total_stored = 0
             
             for i in range(0, len(points), max_batch_size):
@@ -251,13 +243,11 @@ class QdrantService:
                            batch_size=len(batch_points),
                            collection=collection_name)
                 
-                # Try to store this batch with retries
                 if await self._store_batch_with_retry(batch_points, collection_name):
                     total_stored += len(batch_points)
                     logger.info(f"Batch {batch_num} stored successfully", stored_count=len(batch_points))
                 else:
                     logger.error(f"Failed to store batch {batch_num}")
-                    # Continue with other batches instead of failing completely
             
             success_rate = (total_stored / len(points)) * 100 if points else 0
             logger.info("Batch storage completed", 
@@ -265,14 +255,14 @@ class QdrantService:
                        stored_points=total_stored,
                        success_rate=f"{success_rate:.1f}%")
             
-            return total_stored > 0  # Return True if at least some points were stored
+            return total_stored > 0
                 
         except Exception as e:
             logger.error("Failed to store embeddings - general error", 
-                        error=str(e), 
-                        error_type=type(e).__name__,
-                        collection=collection_name,
-                        chunk_count=len(chunks))
+                         error=str(e), 
+                         error_type=type(e).__name__,
+                         collection=collection_name,
+                         chunk_count=len(chunks))
             import traceback
             logger.error("Full traceback", traceback=traceback.format_exc())
             return False
@@ -305,19 +295,107 @@ class QdrantService:
                              point_count=len(points))
                 
                 if attempt == max_retries - 1:
-                    # Last attempt failed
                     logger.error("All retry attempts failed for batch")
                     return False
                 else:
-                    # Wait before retry with exponential backoff
                     await asyncio.sleep(retry_delay)
                     retry_delay *= 1.5
         
         return False
     
+    async def search_hybrid(
+        self,
+        dense_embedding: List[float],
+        sparse_indices: Optional[List[int]] = None,
+        sparse_values: Optional[List[float]] = None,
+        top_k: int = 25,
+        document_id: Optional[str] = None,
+        collection_name: str = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Stage 1 Hybrid Search: Executes dense semantic search + sparse BM25 lexical search
+        fused via Reciprocal Rank Fusion (RRF) directly within Qdrant.
+        """
+        if not self.client:
+            logger.error("Qdrant client not initialized")
+            return []
+            
+        collection_name = collection_name or settings.qdrant_collection_name
+
+        try:
+            search_filter = None
+            if document_id:
+                search_filter = Filter(
+                    must=[
+                        FieldCondition(
+                            key="document_id",
+                            match=MatchValue(value=document_id)
+                        )
+                    ]
+                )
+
+            has_sparse = (
+                sparse_indices is not None 
+                and sparse_values is not None 
+                and len(sparse_indices) > 0 
+                and len(sparse_values) > 0
+            )
+
+            if has_sparse:
+                prefetch = [
+                    Prefetch(
+                        query=dense_embedding,
+                        using="dense",
+                        limit=top_k * 2,
+                        filter=search_filter
+                    ),
+                    Prefetch(
+                        query=SparseVector(indices=sparse_indices, values=sparse_values),
+                        using="sparse",
+                        limit=top_k * 2,
+                        filter=search_filter
+                    ),
+                ]
+                response = await self.client.query_points(
+                    collection_name=collection_name,
+                    prefetch=prefetch,
+                    query=FusionQuery(fusion=Fusion.RRF),
+                    limit=top_k,
+                    with_payload=True
+                )
+            else:
+                response = await self.client.query_points(
+                    collection_name=collection_name,
+                    query=dense_embedding,
+                    using="dense",
+                    query_filter=search_filter,
+                    limit=top_k,
+                    with_payload=True
+                )
+
+            search_results = response.points
+
+            results = [
+                {
+                    "text": result.payload.get("text", "") if result.payload else "",
+                    "document_id": result.payload.get("document_id") if result.payload else None,
+                    "chunk_id": result.payload.get("chunk_id") if result.payload else None,
+                    "score": result.score,
+                    "metadata": result.payload.get("metadata", {}) if result.payload else {}
+                }
+                for result in search_results
+            ]
+
+            logger.info("Hybrid search completed", results_count=len(results), has_sparse=has_sparse)
+            return results
+
+        except Exception as e:
+            logger.error("Failed to execute hybrid search in Qdrant", error=str(e), exc_info=True)
+            return await self.search_similar(dense_embedding, top_k, document_id, collection_name)
+
     async def search_similar(self, query_embedding: List[float], top_k: int = 10, 
                              document_id: Optional[str] = None, collection_name: str = None) -> List[Dict[str, Any]]:
-        """Search for similar embeddings in Qdrant."""
+        """Search for similar embeddings in Qdrant using dense named vector."""
         if not self.client:
             logger.error("Qdrant client not initialized")
             return []
@@ -335,32 +413,29 @@ class QdrantService:
                         )
                     ]
                 )
-                logger.info("Using document filter", document_id=document_id)
-            else:
-                logger.info("Searching without document filter")
-            
-            # Perform search with await and the corrected filter parameter
-            search_results: List[ScoredPoint] = await self.client.search(
+
+            response = await self.client.query_points(
                 collection_name=collection_name,
-                query_vector=query_embedding,
-                query_filter=search_filter, # FIX: Pass the filter here
+                query=query_embedding,
+                using="dense",
+                query_filter=search_filter,
                 limit=top_k,
                 with_payload=True
             )
             
-            logger.info("Raw search results", raw_count=len(search_results))
+            search_results = response.points
             
             results = [
                 {
-                    "text": result.payload.get("text", ""),
-                    "document_id": result.payload.get("document_id"),
-                    "chunk_id": result.payload.get("chunk_id"),
+                    "text": result.payload.get("text", "") if result.payload else "",
+                    "document_id": result.payload.get("document_id") if result.payload else None,
+                    "chunk_id": result.payload.get("chunk_id") if result.payload else None,
                     "score": result.score,
-                    "metadata": result.payload.get("metadata", {})
+                    "metadata": result.payload.get("metadata", {}) if result.payload else {}
                 } for result in search_results
             ]
             
-            logger.info("Search completed", results_count=len(results), collection=collection_name)
+            logger.info("Dense search completed", results_count=len(results), collection=collection_name)
             return results
             
         except Exception as e:

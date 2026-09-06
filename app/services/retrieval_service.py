@@ -98,9 +98,11 @@ class RetrievalService:
             texts = [c.text for c in chunk_batch]
 
             try:
-                embeddings = await self.embedding_service.generate_embeddings(texts)
-                for chunk, emb in zip(chunk_batch, embeddings):
-                    chunk.embedding = emb
+                dense_embs, sparse_embs = await self.embedding_service.generate_hybrid_embeddings(texts)
+                for chunk, d_emb, (s_idx, s_val) in zip(chunk_batch, dense_embs, sparse_embs):
+                    chunk.embedding = d_emb
+                    chunk.sparse_indices = s_idx
+                    chunk.sparse_values = s_val
 
                 success = await self.embedding_service.qdrant_service.store_embeddings(chunk_batch)
                 if success:
@@ -123,7 +125,7 @@ class RetrievalService:
         1. Fast download & SHA-256 byte hashing.
         2. Document ingestion if new.
         3. Multi-layer cache check for questions.
-        4. Parallel Stage 1 Qdrant retrieval (top 25).
+        4. Parallel Stage 1 Qdrant hybrid retrieval (dense + sparse BM25 via RRF, top 25).
         5. Stage 2 FlashRank cross-encoder reranking (top 4).
         6. Semaphore-bounded LLM generation with 2,000 token context budget.
         """
@@ -161,17 +163,19 @@ class RetrievalService:
                 q_indices = [idx for idx, _ in questions_to_retrieve]
                 q_texts = [q for _, q in questions_to_retrieve]
 
-                # Parallel question embeddings
-                q_embeddings = await self.embedding_service.generate_embeddings(q_texts)
+                # Parallel question hybrid embeddings (dense + sparse BM25)
+                q_dense_embs, q_sparse_embs = await self.embedding_service.generate_hybrid_embeddings(q_texts)
 
-                # Parallel Stage 1 Retrieval: Fetch top 25 candidates per question
+                # Parallel Stage 1 Hybrid Retrieval: Fetch top 25 candidates per question via RRF
                 search_tasks = [
-                    self.embedding_service.qdrant_service.search_similar(
-                        query_embedding=emb,
+                    self.embedding_service.qdrant_service.search_hybrid(
+                        dense_embedding=d_emb,
+                        sparse_indices=s_emb[0],
+                        sparse_values=s_emb[1],
                         top_k=self.candidate_top_k,
                         document_id=document_id
                     )
-                    for emb in q_embeddings
+                    for d_emb, s_emb in zip(q_dense_embs, q_sparse_embs)
                 ]
                 candidates_results = await asyncio.gather(*search_tasks, return_exceptions=True)
 

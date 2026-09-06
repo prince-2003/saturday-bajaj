@@ -1,7 +1,7 @@
 import asyncio
 import os
 import tempfile
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import structlog
 import numpy as np
 
@@ -25,6 +25,7 @@ class EmbeddingService:
     
     def __init__(self, qdrant_service: QdrantService = None, cache_service: IntelligentCacheService = None):
         self.fastembed_model = None
+        self.sparse_model = None
         self.openai_client = None
         self.qdrant_service = qdrant_service or QdrantService()
         self.cache_service = cache_service or IntelligentCacheService()
@@ -32,20 +33,24 @@ class EmbeddingService:
         self._initialize_clients()
     
     def _initialize_clients(self):
-        """Initialize local FastEmbed model or OpenAI client fallback."""
-        # 1. Initialize FastEmbed (Primary local engine)
+        """Initialize local FastEmbed dense and sparse models or OpenAI client fallback."""
+        # 1. Initialize FastEmbed (Primary local hybrid engines)
         if getattr(settings, "use_local_embeddings", True):
             try:
-                from fastembed import TextEmbedding
+                from fastembed import TextEmbedding, SparseTextEmbedding
                 cache_dir = os.getenv("FASTEMBED_CACHE_PATH") or os.path.join(tempfile.gettempdir(), "fastembed_cache")
                 model_name = getattr(settings, "fastembed_model", "BAAI/bge-small-en-v1.5")
+                sparse_model_name = getattr(settings, "fastembed_sparse_model", "Qdrant/bm25")
                 
-                logger.info("Initializing local FastEmbed engine...", model=model_name, cache_dir=cache_dir)
+                logger.info("Initializing local FastEmbed dense & sparse engines...", 
+                            dense_model=model_name, sparse_model=sparse_model_name, cache_dir=cache_dir)
                 self.fastembed_model = TextEmbedding(model_name=model_name, cache_dir=cache_dir)
-                logger.info("FastEmbed engine initialized successfully (Zero API cost, zero rate limits)")
+                self.sparse_model = SparseTextEmbedding(model_name=sparse_model_name, cache_dir=cache_dir)
+                logger.info("FastEmbed hybrid engines initialized successfully (Dense BGE-Small + Sparse BM25)")
             except Exception as e:
                 logger.warning("Failed to initialize FastEmbed, checking for OpenAI fallback", error=str(e))
                 self.fastembed_model = None
+                self.sparse_model = None
         
         # 2. Initialize OpenAI client (Fallback or alternative)
         if settings.openai_api_key:
@@ -126,6 +131,44 @@ class EmbeddingService:
         except Exception as e:
             logger.error("Failed to generate embeddings", error=str(e), exc_info=True)
             raise
+
+    async def generate_sparse_embeddings(self, texts: List[str]) -> List[Tuple[List[int], List[float]]]:
+        """
+        Generate BM25 sparse embeddings (token indices and weights) for a list of texts.
+        """
+        if not texts:
+            return []
+
+        if not self.sparse_model:
+            logger.warning("Sparse embedding model not initialized, returning empty sparse vectors")
+            return [([], []) for _ in texts]
+
+        try:
+            safe_texts = [self._truncate_text(t, 512) for t in texts]
+
+            def run_sparse():
+                results = []
+                generator = self.sparse_model.embed(safe_texts)
+                for sp in generator:
+                    results.append((sp.indices.tolist(), sp.values.tolist()))
+                return results
+
+            return await asyncio.to_thread(run_sparse)
+        except Exception as e:
+            logger.error("Failed to generate sparse BM25 embeddings", error=str(e), exc_info=True)
+            return [([], []) for _ in texts]
+
+    async def generate_hybrid_embeddings(
+        self, texts: List[str]
+    ) -> Tuple[List[List[float]], List[Tuple[List[int], List[float]]]]:
+        """
+        Generate both dense (384d) and sparse (BM25) embeddings concurrently.
+        Returns: (dense_embeddings, sparse_embeddings)
+        """
+        dense_task = self.generate_embeddings(texts)
+        sparse_task = self.generate_sparse_embeddings(texts)
+        dense_embs, sparse_embs = await asyncio.gather(dense_task, sparse_task)
+        return dense_embs, sparse_embs
 
     async def store_embeddings(self, chunks: List[EmbeddingChunk], collection_name: str = None) -> bool:
         """Store chunk embeddings in Qdrant."""

@@ -14,14 +14,15 @@ A high-throughput, low-latency document analysis and Retrieval-Augmented Generat
 
 ## 🚀 Key Architectural Highlights
 
-* **100% Local FastEmbed Embeddings (Zero API Quota / Zero 429 Errors)**:
-  - Powered by local CPU ONNX **FastEmbed** (`BAAI/bge-small-en-v1.5`, 384 dimensions).
-  - Eliminates cloud embedding API dependencies, rate limits, and billing exhaustion.
-  - Sub-20ms batch inference on standard CPU cores.
+* **Native Hybrid Search (BM25 Lexical + Dense Semantic + RRF Fusion)**:
+  - Dual named vector schema in Qdrant: `"dense"` (384-dim BGE-small-en-v1.5) and `"sparse"` (`SparseVectorParams`).
+  - CPU-local sparse BM25 text embedding generation via **FastEmbed** (`Qdrant/bm25`) with sub-millisecond overhead.
+  - Server-side **Reciprocal Rank Fusion (RRF)** via Qdrant's `query_points` with `Prefetch` merging exact keyword hits (acronyms, numbers, codes) and deep semantic meaning.
 
-* **Two-Stage Precision Retrieval**:
-  - **Stage 1 (Broad Candidate Search)**: Retrieves top 25 candidates using Qdrant vector similarity.
+* **Two-Stage Precision Retrieval Pipeline**:
+  - **Stage 1 (Hybrid RRF Retrieval)**: Fetches the top 25 fused candidates from Qdrant balancing semantic and lexical scores.
   - **Stage 2 (Cross-Encoder Reranking)**: Uses **FlashRank** (`ms-marco-TinyBERT-L-2-v2`) to jointly evaluate query-passage tokens with deep cross-attention, selecting the top 4 high-signal chunks in ~10ms.
+  - **Zero External Retrieval APIs**: 100% of embedding, hybrid retrieval, and reranking runs locally inside the container on CPU.
 
 * **Google Gemini 3.6 Flash Generation**:
   - Primary synthesis powered by Google's `gemini-3.6-flash` with dynamic fallback to `gemini-flash-latest`.
@@ -42,7 +43,7 @@ A high-throughput, low-latency document analysis and Retrieval-Augmented Generat
 
 * **Production Containerization**:
   - Multi-stage Docker image with non-root security (`appuser:1001`).
-  - Both FlashRank and FastEmbed ONNX models are pre-baked into `/app/models/` during `docker build`, ensuring zero cold-start download delays.
+  - FlashRank, FastEmbed dense, and FastEmbed BM25 ONNX models are pre-baked into `/app/models/` during `docker build`, ensuring zero cold-start download delays.
   - Built-in container health check endpoint at `/health`.
 
 ---
@@ -53,19 +54,21 @@ A high-throughput, low-latency document analysis and Retrieval-Augmented Generat
 graph TD
     Client["Client / Evaluation Harness"] -->|"HTTP POST /api/v1/hackrx/run"| API["FastAPI Application (Port 8000)"]
     
-    subgraph "Ingestion & Resolution"
+    subgraph "Ingestion & Dual-Vector Encoding"
         API -->|"Resolve Link / Folder"| CloudResolver["Cloud Resolver (Drive / Docs / Dropbox)"]
         CloudResolver -->|"Byte Stream"| PyMuPDF["PyMuPDF (fitz) In-Memory Parser"]
         PyMuPDF -->|"Structure & Pages"| ChunkEngine["Paragraph Chunking ([Page X])"]
-        ChunkEngine -->|"Text Chunks"| FastEmbed["FastEmbed ONNX (bge-small-en-v1.5)"]
-        FastEmbed -->|"384-dim Vectors"| Qdrant["Qdrant Vector DB (:6333)"]
+        ChunkEngine -->|"Text Chunks"| FastEmbedDense["FastEmbed Dense (bge-small-en-v1.5)"]
+        ChunkEngine -->|"Text Chunks"| FastEmbedSparse["FastEmbed Sparse (Qdrant/bm25)"]
+        FastEmbedDense -->|"Dense 384d"| Qdrant["Qdrant Hybrid Collection (:6333)"]
+        FastEmbedSparse -->|"Sparse BM25"| Qdrant
     end
 
-    subgraph "Two-Stage Retrieval Pipeline"
+    subgraph "Two-Stage Hybrid Retrieval Pipeline"
         API -->|"Exact Match Check"| Cache["Multi-Layer Cache (Memory + Redis)"]
         Cache -.->|"Cache Hit (0.06s)"| Output["Answer Response"]
-        API -->|"Query Vector"| Stage1["Stage 1: Qdrant Search (Top 25 Candidates)"]
-        Stage1 -->|"Raw Candidates"| Stage2["Stage 2: FlashRank Cross-Encoder (Top 4 Chunks)"]
+        API -->|"Dense + Sparse Query"| Stage1["Stage 1: Qdrant Hybrid RRF Search (Top 25)"]
+        Stage1 -->|"RRF Candidates"| Stage2["Stage 2: FlashRank Cross-Encoder (Top 4 Chunks)"]
         Stage2 -->|"Bounded Context (2k tokens)"| Semaphore["asyncio.Semaphore(5)"]
         Semaphore -->|"Synthesis Prompt"| Gemini["Google Gemini 3.6 Flash"]
         Gemini --> Output

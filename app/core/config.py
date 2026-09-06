@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # Embedding Configuration
     use_local_embeddings: bool = True
     fastembed_model: str = "BAAI/bge-small-en-v1.5"
+    fastembed_sparse_model: str = "Qdrant/bm25"
     embedding_dimension: int = 384  # BAAI/bge-small-en-v1.5 dimension (was 3072 for OpenAI large)
     
     # Qdrant Configuration (Primary Vector DB)

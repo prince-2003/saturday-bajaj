@@ -46,6 +46,7 @@ COPY render.yaml .
 # Pre-bake FlashRank cross-encoder and FastEmbed models into image
 RUN python -c "from flashrank import Ranker; Ranker(model_name='ms-marco-TinyBERT-L-2-v2', cache_dir='/app/models/flashrank')"
 RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='/app/models/fastembed')"
+RUN python -c "from fastembed import SparseTextEmbedding; SparseTextEmbedding(model_name='Qdrant/bm25', cache_dir='/app/models/fastembed')"
 
 # Create non-root system user and assign permissions
 RUN useradd -m -u 1001 appuser && \
