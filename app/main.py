@@ -105,3 +105,12 @@ async def root():
         "status": "operational"
     }
 
+@app.get("/health")
+async def health():
+    """Top-level health check endpoint for container orchestrators and Render."""
+    return {
+        "status": "healthy",
+        "service": "intelligent-query-retrieval",
+        "version": "1.0.0"
+    }
+

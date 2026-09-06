@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     
     # Google Gemini Configuration (New Primary LLM)
     google_api_key: Optional[str] = None
-    gemini_model: str = "gemini-2.5-flash"  # Use only 2.5-flash for all queries
+    gemini_model: str = "gemini-3.6-flash"
     gemini_max_tokens: int = 8192
     
     # Timeout Configuration
@@ -36,8 +36,9 @@ class Settings(BaseSettings):
     document_processing_timeout: int = 180  # 3 minutes for document processing
     
     # Embedding Configuration
-    # Embedding Configuration
-    embedding_dimension: int = 3072  # text-embedding-3-large dimension (was 1536 for ada-002)
+    use_local_embeddings: bool = True
+    fastembed_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_dimension: int = 384  # BAAI/bge-small-en-v1.5 dimension (was 3072 for OpenAI large)
     
     # Qdrant Configuration (Primary Vector DB)
     qdrant_url: Optional[str] = None

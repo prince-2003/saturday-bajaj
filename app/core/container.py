@@ -15,6 +15,7 @@ from app.services.optimized_llm_service import OptimizedLLMService
 from app.services.cache_service import IntelligentCacheService
 from app.services.database_service import DatabaseService
 from app.services.qdrant_service import QdrantService
+from app.services.rerank_service import RerankService
 
 logger = structlog.get_logger(__name__)
 
@@ -64,6 +65,7 @@ class ServiceContainer:
                 cache_service=self._services['cache_service']
             )
             self._services['llm_service'] = OptimizedLLMService(self._services['cache_service'])
+            self._services['rerank_service'] = RerankService()
             
             # --- Phase 2: Inject circular dependencies (THE FIX) ---
             # Now that embedding_service is created, give it to the cache_service
@@ -78,7 +80,8 @@ class ServiceContainer:
                 embedding_service=self._services['embedding_service'],
                 llm_service=self._services['llm_service'],
                 cache_service=self._services['cache_service'],
-                database_service=self._services['database_service']
+                database_service=self._services['database_service'],
+                rerank_service=self._services['rerank_service']
             )
             
             logger.info("All services initialized and wired successfully")
@@ -117,6 +120,11 @@ class ServiceContainer:
     def qdrant_service(self) -> QdrantService:
         """Get the Qdrant service instance."""
         return self._services['qdrant_service']
+    
+    @property
+    def rerank_service(self) -> RerankService:
+        """Get the Rerank service instance."""
+        return self._services['rerank_service']
     
     @property
     def retrieval_service(self) -> 'RetrievalService':
@@ -256,3 +264,7 @@ def get_database_service() -> DatabaseService:
 def get_qdrant_service() -> QdrantService:
     """Get the Qdrant service instance."""
     return get_service_container().qdrant_service
+
+def get_rerank_service() -> RerankService:
+    """Get the Rerank service instance."""
+    return get_service_container().rerank_service

@@ -17,6 +17,10 @@ class QdrantService:
         # The client will be initialized as AsyncQdrantClient
         self.client: Optional[AsyncQdrantClient] = None
         self._initialize_client()
+        
+    async def initialize(self) -> bool:
+        """Async initialization compatibility hook."""
+        return self.client is not None
     
     def _initialize_client(self):
         """Initialize AsyncQdrantClient."""
@@ -26,6 +30,7 @@ class QdrantService:
                 self.client = AsyncQdrantClient(
                     url=settings.qdrant_url,
                     api_key=settings.qdrant_api_key,
+                    check_compatibility=False
                 )
                 logger.info("Qdrant async cloud client initialized", url=settings.qdrant_url)
             elif settings.qdrant_host:
@@ -33,6 +38,7 @@ class QdrantService:
                 self.client = AsyncQdrantClient(
                     host=settings.qdrant_host,
                     port=settings.qdrant_port,
+                    check_compatibility=False
                 )
                 logger.info("Qdrant async local client initialized", host=settings.qdrant_host, port=settings.qdrant_port)
             else:
@@ -64,15 +70,30 @@ class QdrantService:
                         distance=Distance.COSINE
                     )
                 )
-                logger.info("Created Qdrant collection", collection=collection_name)
+                logger.info("Created Qdrant collection", collection=collection_name, dimension=settings.embedding_dimension)
                 
                 # Step 2: IMMEDIATELY create the necessary index after creating the collection
                 logger.info("Creating payload index for 'document_id' on new collection.")
                 await self.create_payload_index(collection_name, "document_id", "keyword")
+            else:
+                # Validate vector dimension matches settings.embedding_dimension
+                try:
+                    info = await self.client.get_collection(collection_name=collection_name)
+                    vectors_conf = info.config.params.vectors
+                    curr_size = None
+                    if hasattr(vectors_conf, "size"):
+                        curr_size = vectors_conf.size
+                    elif isinstance(vectors_conf, dict) and "" in vectors_conf:
+                        curr_size = vectors_conf[""].size
 
-            # Optional: You could even add a check here to ensure the index exists on existing collections,
-            # but the primary fix is to create it with the collection.
-            
+                    if curr_size and curr_size != settings.embedding_dimension:
+                        logger.warning("Qdrant collection dimension mismatch, auto-migrating...", 
+                                       current_size=curr_size, 
+                                       expected_size=settings.embedding_dimension)
+                        return await self.recreate_collection_with_correct_dimensions(collection_name)
+                except Exception as dim_err:
+                    logger.warning("Could not verify existing collection dimension", error=str(dim_err))
+
             return True
             
         except Exception as e:

@@ -1,0 +1,42 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# Git & CI/CD
+.git/
+.gitignore
+.github/
+
+# Environment files and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editor and IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+
+# Temporary directories and logs
+*.log
+brain/
+scratch/
+test-reports/
+htmlcov/
+.coverage
+.pytest_cache/
+
+# OS specific files
+.DS_Store
+Thumbs.db

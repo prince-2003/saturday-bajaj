@@ -19,8 +19,10 @@ anthropic==0.60.0
 google-generativeai==0.8.3
 tiktoken==0.5.1
 
-# Vector database
+# Vector database & Reranking & Local Embeddings
 qdrant-client==1.15.1
+flashrank>=0.2.0
+fastembed>=0.3.0
 
 # Caching
 redis==5.0.1
