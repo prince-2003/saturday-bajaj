@@ -19,6 +19,8 @@ class EmbeddingChunk(BaseModelConfig):
     chunk_id: str = Field(..., description="Unique identifier for the chunk")
     text: str = Field(..., description="Text content of the chunk")
     embedding: Optional[List[float]] = Field(default=None, description="Vector embedding of the chunk")
+    sparse_indices: Optional[List[int]] = Field(default=None, description="Sparse BM25 token indices")
+    sparse_values: Optional[List[float]] = Field(default=None, description="Sparse BM25 token weights")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
     document_id: Optional[str] = Field(default=None, description="ID of the source document")
     chunk_index: int = Field(default=0, description="Index of the chunk within the document")

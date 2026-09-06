@@ -191,14 +191,16 @@ scratch.py
 *.pdf
 !test_policy.pdf
 
-# API keys and secrets (extra safety)
+# API keys, environment files, and secrets (extra safety)
 *.key
 *.pem
 secrets.json
 config.local.json
+.env
+.env.*
+requir.txt
 
 # Docker
-.dockerignore
 docker-compose.override.yml
 
 # Jupyter notebooks (if any)

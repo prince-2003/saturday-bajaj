@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import structlog
 import uvicorn
+import asyncio
 
 # Set up logging early
 from app.core.logging import setup_logging
@@ -65,6 +66,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Configure longer timeouts to prevent 499 errors
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -72,6 +74,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add timeout middleware
+@app.middleware("http")
+async def timeout_middleware(request, call_next):
+    try:
+        # Set a reasonable timeout for all requests
+        response = await asyncio.wait_for(call_next(request), timeout=300.0)  # 5 minutes
+        return response
+    except asyncio.TimeoutError:
+        logger.error("Request timeout", path=request.url.path)
+        from fastapi import HTTPException
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Request timeout - processing took longer than 5 minutes"}
+        )
+    except Exception as e:
+        logger.error("Middleware error", error=str(e))
+        raise
 
 app.include_router(hackrx.router, prefix="/api/v1")
 app.include_router(health.router, prefix="/api/v1")
@@ -82,5 +103,14 @@ async def root():
         "message": "LLM-Powered Intelligent Query-Retrieval System",
         "version": "1.0.0",
         "status": "operational"
+    }
+
+@app.get("/health")
+async def health():
+    """Top-level health check endpoint for container orchestrators and Render."""
+    return {
+        "status": "healthy",
+        "service": "intelligent-query-retrieval",
+        "version": "1.0.0"
     }
 
