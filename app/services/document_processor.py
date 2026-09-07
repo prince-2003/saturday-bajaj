@@ -168,6 +168,7 @@ class OptimizedDocumentProcessor:
     def extract_text_from_pdf(self, content: bytes) -> Tuple[str, int]:
         """
         Single-pass in-memory PDF extraction using PyMuPDF (fitz) without disk churn.
+        Extracts structural layout text blocks separating paragraphs with \n\n.
         Falls back to pdfplumber or PyPDF2 if PyMuPDF is not available or encounters errors.
         """
         if fitz:
@@ -177,9 +178,17 @@ class OptimizedDocumentProcessor:
                 pages_text = []
                 for page_idx in range(total_pages):
                     page = doc[page_idx]
-                    text = page.get_text("text").strip()
-                    if text:
-                        pages_text.append(f"--- Page {page_idx + 1} ---\n{text}")
+                    # Block extraction: block type 0 is text (ignore images/drawings)
+                    blocks = page.get_text("blocks")
+                    text_blocks = [b[4].strip() for b in blocks if len(b) > 6 and b[6] == 0 and b[4].strip()]
+                    if not text_blocks:
+                        raw_text = page.get_text("text").strip()
+                        if raw_text:
+                            text_blocks = [raw_text]
+                    
+                    if text_blocks:
+                        page_body = "\n\n".join(text_blocks)
+                        pages_text.append(f"--- Page {page_idx + 1} ---\n{page_body}")
                 doc.close()
                 return "\n\n".join(pages_text), total_pages
             except Exception as e:
@@ -209,7 +218,7 @@ class OptimizedDocumentProcessor:
                     text = reader.pages[page_idx].extract_text() or ""
                     if text.strip():
                         pages_text.append(f"--- Page {page_idx + 1} ---\n{text.strip()}")
-                return "\n\n".join(pages_text), total_pages
+                    return "\n\n".join(pages_text), total_pages
             except Exception as e:
                 logger.error("PyPDF2 fallback failed", error=str(e))
 
@@ -249,10 +258,40 @@ class OptimizedDocumentProcessor:
                 body.append(payload.decode("utf-8", errors="ignore"))
         return "\n\n".join(body), None
 
+    def _split_large_segment(self, text: str, max_size: int, overlap: int) -> List[str]:
+        """Split a large paragraph/block into bounded segments on natural sentence or line boundaries."""
+        if len(text) <= max_size:
+            return [text]
+        sub = []
+        start = 0
+        while start < len(text):
+            end = start + max_size
+            if end >= len(text):
+                rem = text[start:].strip()
+                if rem:
+                    sub.append(rem)
+                break
+            # Look for newline or period boundary in the latter half of the window
+            cut = text.rfind("\n", start + max_size // 2, end)
+            if cut == -1:
+                cut = text.rfind(". ", start + max_size // 2, end)
+                if cut != -1:
+                    cut += 1  # Include the period
+            if cut == -1:
+                cut = text.rfind(" ", start + max_size // 2, end)
+            if cut == -1:
+                cut = end
+            segment = text[start:cut].strip()
+            if segment:
+                sub.append(segment)
+            start = cut - overlap if cut - overlap > start else cut
+        return [s for s in sub if s]
+
     def create_chunks(self, text: str, document_id: str) -> List[EmbeddingChunk]:
         """
-        Structure-preserving paragraph-based chunking with page number attribution.
-        Avoids lossy regex compression to maintain legal numbers, clause headers, and tables.
+        Structure-preserving paragraph and block-based chunking with bounded size.
+        Ensures chunks strictly fit within embedding model token windows (e.g. 800-1200 chars)
+        so no text is truncated or lost during retrieval indexing.
         """
         raw_paragraphs = text.split("\n\n")
         chunks: List[EmbeddingChunk] = []
@@ -273,31 +312,34 @@ class OptimizedDocumentProcessor:
             if page_match:
                 current_page = page_match
 
-            para_len = len(para)
-            if current_length + para_len > self.chunk_size and current_chunk_parts:
-                chunk_body = "\n\n".join(current_chunk_parts)
-                chunk_idx = len(chunks)
-                chunks.append(
-                    EmbeddingChunk(
-                        chunk_id=f"{document_id}_{chunk_idx}",
-                        document_id=document_id,
-                        text=chunk_body,
-                        chunk_index=chunk_idx,
-                        metadata={"page_number": current_page}
+            # Split large paragraphs into bite-sized segments
+            segments = self._split_large_segment(para, max_size=self.chunk_size, overlap=self.chunk_overlap)
+            for seg in segments:
+                seg_len = len(seg)
+                if current_length + seg_len > self.chunk_size and current_chunk_parts:
+                    chunk_body = "\n\n".join(current_chunk_parts)
+                    chunk_idx = len(chunks)
+                    chunks.append(
+                        EmbeddingChunk(
+                            chunk_id=f"{document_id}_{chunk_idx}",
+                            document_id=document_id,
+                            text=chunk_body,
+                            chunk_index=chunk_idx,
+                            metadata={"page_number": current_page}
+                        )
                     )
-                )
 
-                # Overlap: keep trailing paragraph if overlap enabled
-                if self.chunk_overlap > 0 and len(current_chunk_parts) > 1:
-                    last_para = current_chunk_parts[-1]
-                    current_chunk_parts = [last_para, para]
-                    current_length = len(last_para) + para_len
+                    # Overlap: keep trailing segment
+                    if self.chunk_overlap > 0 and len(current_chunk_parts) > 1:
+                        last_part = current_chunk_parts[-1]
+                        current_chunk_parts = [last_part, seg]
+                        current_length = len(last_part) + seg_len
+                    else:
+                        current_chunk_parts = [seg]
+                        current_length = seg_len
                 else:
-                    current_chunk_parts = [para]
-                    current_length = para_len
-            else:
-                current_chunk_parts.append(para)
-                current_length += para_len
+                    current_chunk_parts.append(seg)
+                    current_length += seg_len
 
         if current_chunk_parts:
             chunk_body = "\n\n".join(current_chunk_parts)

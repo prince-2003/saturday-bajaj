@@ -44,8 +44,8 @@ class RetrievalService:
         self.llm_service = llm_service or OptimizedLLMService(self.cache_service)
         self.rerank_service = rerank_service or RerankService()
         
-        self.candidate_top_k = 25
-        self.rerank_top_k = 4
+        self.candidate_top_k = 30
+        self.rerank_top_k = 6
         self.ingest_batch_size = 100
 
         logger.info("RetrievalService initialized with Two-Stage Reranking", 

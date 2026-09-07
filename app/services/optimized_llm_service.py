@@ -118,7 +118,7 @@ class OptimizedLLMService:
         return len(text.split()) * 1.3  # Rough estimation
     
     def optimize_context(self, context_chunks: List[Dict[str, Any]], 
-                        query: str, max_tokens: int = 2000) -> str:
+                        query: str, max_tokens: int = 3500) -> str:
         """Optimize context by selecting most relevant chunks within strict token limit."""
         if not context_chunks:
             logger.warning("No context chunks provided to optimize_context")
@@ -142,7 +142,11 @@ class OptimizedLLMService:
                 if isinstance(chunk.get("metadata"), dict) 
                 else chunk.get("page_number", "N/A")
             ) or "N/A"
-            chunk_text = f"[Page {page_num}] {chunk.get('text', '')}"
+            base_text = chunk.get('text', '').strip()
+            if base_text.startswith(f"[Page {page_num}]") or base_text.startswith(f"--- Page {page_num}"):
+                chunk_text = base_text
+            else:
+                chunk_text = f"[Page {page_num}] {base_text}"
             chunk_tokens = self.count_tokens(chunk_text)
             
             if total_tokens + chunk_tokens <= available_tokens:
@@ -251,8 +255,8 @@ Respond with a minimal, precise answer. Use a short summary or bullet points. Do
             # Classify question complexity
             complexity = self.complexity_classifier.classify(question)
             
-            # Enforce 2,000 token context budget for high speed and low latency
-            max_context_tokens = 2000
+            # Enforce 3,500 token context budget for high speed and low latency
+            max_context_tokens = 3500
             context = self.optimize_context(context_chunks, question, max_context_tokens)
             
             logger.info("Context prepared for LLM", 
